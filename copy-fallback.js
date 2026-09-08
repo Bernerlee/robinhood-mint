@@ -66,7 +66,7 @@
  */
 
 import "dotenv/config";
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
 import { ethers } from "ethers";
 import fetch from "node-fetch";
@@ -244,6 +244,7 @@ async function dbRemoveWallet(address) {
 // In-memory cache, refreshed on a timer so /addwallet takes effect without
 // a restart, but the hot poll loop doesn't hit Supabase every second.
 let watchedWallets = [];
+let isPaused = false; // when true, bot detects but does not mint
 
 async function refreshWatchedWallets() {
   try {
@@ -273,6 +274,119 @@ async function notify(text) {
     console.error(`[telegram] failed to send message: ${err.message}`);
   }
 }
+
+// ===== BUTTON MENU =====
+const mainMenu = Markup.keyboard([
+  ["📊 Status", "👛 Wallets"],
+  ["💰 Balances", "⚙️ Settings"],
+  ["⏸ Pause", "▶️ Resume"],
+  ["ℹ️ Help"],
+]).resize();
+
+bot.start(async (ctx) => {
+  if (!isAuthorizedChat(ctx)) {
+    return ctx.reply("Unauthorized.");
+  }
+  await ctx.reply("🤖 Mint Copy Bot\n\nChoose an option:", mainMenu);
+});
+
+bot.hears("📊 Status", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+
+  const mintingWalletsCount = wallets?.length || (WALLET_ADDRESS ? 1 : 0);
+  const pauseText = isPaused ? "⏸ Paused" : "▶️ Running";
+  const dryRunText = DRY_RUN ? "🧪 Dry Run (ON)" : "🔥 Live Minting (OFF)";
+
+  let mintingList = "None";
+  if (wallets && wallets.length > 0) {
+    mintingList = wallets
+      .map(
+        (w, i) =>
+          `${i + 1}. <code>${escapeHtml(w.address.slice(0, 12))}...</code>`,
+      )
+      .join("\n");
+  } else if (WALLET_ADDRESS) {
+    mintingList = `<code>${escapeHtml(WALLET_ADDRESS.slice(0, 12))}...</code>`;
+  }
+
+  const message =
+    `📊 <b>Bot Status</b>\n\n` +
+    `State: <b>${pauseText}</b>\n` +
+    `Mode: <b>${dryRunText}</b>\n` +
+    `Chain: <b>${CHAIN_ID}</b>\n` +
+    `Poll interval: <b>${POLL_INTERVAL_MS}ms</b>\n\n` +
+    `👀 Watched wallets: <b>${watchedWallets.length}</b>\n` +
+    `💼 Minting wallets: <b>${mintingWalletsCount}</b>\n` +
+    `${mintingList}\n\n` +
+    `💰 Max price: <b>${MAX_PRICE_ETH ?? "not set"} ETH</b>\n` +
+    `🔢 Quantities: <b>${process.env.QUANTITY_TRIES || "10,5,3,2,1"}</b>`;
+
+  await ctx.reply(message, { parse_mode: "HTML" });
+});
+
+bot.hears("👛 Wallets", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  await refreshWatchedWallets();
+  if (watchedWallets.length === 0) {
+    return ctx.reply("No watched wallets yet.\nUse /addwallet 0x...");
+  }
+  const list = watchedWallets.map((w, i) => `${i + 1}. ${w}`).join("\n");
+  await ctx.reply(`Watching ${watchedWallets.length} wallet(s):\n${list}`);
+});
+
+bot.hears("⚙️ Settings", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  await ctx.reply(
+    `Settings\n\nDRY_RUN: ${DRY_RUN}\nMAX_PRICE_ETH: ${MAX_PRICE_ETH ?? "not set"}\nQUANTITY_TRIES: ${process.env.QUANTITY_TRIES || "10,5,3,2,1"}`,
+  );
+});
+
+bot.hears("ℹ️ Help", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  await ctx.reply(
+    `Commands:\n/start — show menu\n/addwallet 0x...\n/removewallet 0x...\n/wallets\n/status\n/help`,
+  );
+});
+
+bot.hears("⏸ Pause", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  isPaused = true;
+  await ctx.reply(
+    "⏸ Bot paused.\nIt will still detect mints but will not try to mint.",
+  );
+});
+
+bot.hears("▶️ Resume", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  isPaused = false;
+  await ctx.reply("▶️ Bot resumed.\nMinting is active again.");
+});
+
+bot.hears("💰 Balances", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+
+  try {
+    const provider = rpcPool.current();
+    const list = wallets.length > 0 ? wallets : [{ address: WALLET_ADDRESS }];
+
+    if (!list[0]?.address) {
+      return ctx.reply("No minting wallets configured.");
+    }
+
+    let message = `💰 <b>Minting wallet balances</b>\n\n`;
+
+    for (const w of list) {
+      const balance = await provider.getBalance(w.address);
+      const eth = Number(ethers.formatEther(balance)).toFixed(5);
+      message += `<code>${escapeHtml(w.address.slice(0, 10))}...</code> → <b>${eth} ETH</b>\n`;
+    }
+
+    await ctx.reply(message, { parse_mode: "HTML" });
+  } catch (err) {
+    await ctx.reply(`❌ Failed to fetch balances: ${err.message}`);
+  }
+});
+// ===== END BUTTON MENU =====
 
 bot.command("help", (ctx) => {
   ctx.reply(
@@ -346,17 +460,39 @@ bot.command("wallets", async (ctx) => {
   });
 });
 
-bot.command("status", (ctx) => {
+bot.command("status", async (ctx) => {
   if (!isAuthorizedChat(ctx)) return;
-  ctx.reply(
-    `Chain: ${CHAIN_ID}\n` +
-      `Watched wallets: ${watchedWallets.length}\n` +
-      `Poll interval: ${POLL_INTERVAL_MS}ms\n` +
-      `DRY_RUN: ${DRY_RUN}\n` +
-      `Minting wallet: ${DRY_RUN ? "n/a (dry run)" : WALLET_ADDRESS}`,
-  );
-});
 
+  const mintingWalletsCount = wallets?.length || (WALLET_ADDRESS ? 1 : 0);
+  const pauseText = isPaused ? "⏸ Paused" : "▶️ Running";
+  const dryRunText = DRY_RUN ? "🧪 Dry Run (ON)" : "🔥 Live Minting (OFF)";
+
+  let mintingList = "None";
+  if (wallets && wallets.length > 0) {
+    mintingList = wallets
+      .map(
+        (w, i) =>
+          `${i + 1}. <code>${escapeHtml(w.address.slice(0, 12))}...</code>`,
+      )
+      .join("\n");
+  } else if (WALLET_ADDRESS) {
+    mintingList = `<code>${escapeHtml(WALLET_ADDRESS.slice(0, 12))}...</code>`;
+  }
+
+  const message =
+    `📊 <b>Bot Status</b>\n\n` +
+    `State: <b>${pauseText}</b>\n` +
+    `Mode: <b>${dryRunText}</b>\n` +
+    `Chain: <b>${CHAIN_ID}</b>\n` +
+    `Poll interval: <b>${POLL_INTERVAL_MS}ms</b>\n\n` +
+    `👀 Watched wallets: <b>${watchedWallets.length}</b>\n` +
+    `💼 Minting wallets: <b>${mintingWalletsCount}</b>\n` +
+    `${mintingList}\n\n` +
+    `💰 Max price: <b>${MAX_PRICE_ETH ?? "not set"} ETH</b>\n` +
+    `🔢 Quantities: <b>${process.env.QUANTITY_TRIES || "10,5,3,2,1"}</b>`;
+
+  await ctx.reply(message, { parse_mode: "HTML" });
+});
 // ---------------------------------------------------------------------------
 // Multi-RPC pool with failover
 // ---------------------------------------------------------------------------
@@ -397,15 +533,66 @@ class RpcPool {
 }
 
 const rpcPool = new RpcPool(RPC_URLS, CHAIN_ID);
-const signer = DRY_RUN
-  ? null
-  : new ethers.Wallet(PRIVATE_KEY, rpcPool.current());
 
-if (signer && signer.address.toLowerCase() !== WALLET_ADDRESS) {
-  throw new Error(
-    `PRIVATE_KEY belongs to ${signer.address}, not WALLET_ADDRESS (${WALLET_ADDRESS}).`,
-  );
+// ========== Multi-wallet support ==========
+const PRIVATE_KEYS_RAW = (
+  process.env.PRIVATE_KEYS ||
+  process.env.PRIVATE_KEY ||
+  ""
+)
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
+const WALLET_ADDRESSES_RAW = (
+  process.env.WALLET_ADDRESSES ||
+  process.env.WALLET_ADDRESS ||
+  ""
+)
+  .split(",")
+  .map((a) => a.trim().toLowerCase())
+  .filter(Boolean);
+
+const wallets = [];
+
+if (!DRY_RUN) {
+  if (PRIVATE_KEYS_RAW.length === 0) {
+    throw new Error(
+      "PRIVATE_KEYS or PRIVATE_KEY is required when DRY_RUN=false",
+    );
+  }
+
+  for (let i = 0; i < PRIVATE_KEYS_RAW.length; i++) {
+    let key = PRIVATE_KEYS_RAW[i];
+    if (!key.startsWith("0x")) key = "0x" + key;
+
+    if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+      throw new Error(`Invalid private key at position ${i + 1}`);
+    }
+
+    const wallet = new ethers.Wallet(key);
+    const expected = WALLET_ADDRESSES_RAW[i];
+
+    if (expected && wallet.address.toLowerCase() !== expected) {
+      throw new Error(
+        `Private key #${i + 1} does not match WALLET_ADDRESSES #${i + 1}`,
+      );
+    }
+
+    wallets.push({
+      address: wallet.address.toLowerCase(),
+      signer: wallet,
+    });
+  }
+
+  console.log(`[startup] Loaded ${wallets.length} minting wallet(s)`);
 }
+
+// Keep old single signer for compatibility with other parts of the code
+const signer =
+  wallets.length > 0 ? wallets[0].signer.connect(rpcPool.current()) : null;
+const WALLET_ADDRESS_EFFECTIVE =
+  wallets.length > 0 ? wallets[0].address : WALLET_ADDRESS;
 
 // ---------------------------------------------------------------------------
 // OpenSea helpers
@@ -484,78 +671,148 @@ function abiHasFunction(abi, name) {
 }
 
 async function attemptDirectMint(contractAddress, sourceWallet) {
+  await notify(
+    `⚙️ <b>Direct mint fallback</b>\n` +
+      `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+      `Trying common mint functions...`,
+  );
+
   if (DRY_RUN) {
-    console.log(
-      `[dry-run][fallback] Would attempt direct on-chain mint on ${contractAddress}.`,
-    );
     await notify(
-      `🧪 <b>Dry run</b>: <code>${escapeHtml(sourceWallet)}</code> minted from <code>${escapeHtml(contractAddress)}</code> — no OpenSea Drop found. ` +
-        `Would attempt a direct on-chain mint (not broadcast).`,
+      `🧪 <b>Dry run</b>: would try direct on-chain mint on <code>${escapeHtml(contractAddress)}</code> (not broadcast)`,
     );
     return;
   }
 
-  const provider = rpcPool.current();
-  const connectedSigner = signer.connect(provider);
-  const remoteAbi = await fetchAbiFromExplorer(contractAddress);
+  if (!signer && wallets.length === 0) {
+    await notify(`❌ No minting wallet/signer available for direct mint`);
+    return;
+  }
 
-  const candidates = [];
-  if (remoteAbi) {
-    for (const fnName of ["mint", "publicMint", "claim"]) {
-      if (abiHasFunction(remoteAbi, fnName)) {
-        candidates.push(
-          new ethers.Contract(contractAddress, remoteAbi, connectedSigner),
+  const provider = rpcPool.current();
+  const mintWallets =
+    wallets.length > 0
+      ? wallets
+      : [
+          {
+            address: WALLET_ADDRESS,
+            signer: signer,
+          },
+        ];
+
+  // More common mint function signatures
+  const EXTRA_MINT_ABIS = [
+    "function mint() public payable",
+    "function mint(uint256 quantity) public payable",
+    "function mint(address to) public payable",
+    "function mint(address to, uint256 quantity) public payable",
+    "function publicMint() public payable",
+    "function publicMint(uint256 quantity) public payable",
+    "function claim() public payable",
+    "function claim(uint256 quantity) public payable",
+    "function claim(address to, uint256 quantity) public payable",
+    "function safeMint(address to) public payable",
+    "function safeMint(address to, uint256 quantity) public payable",
+    "function mintNFT(uint256 quantity) public payable",
+    "function mintPublic(uint256 quantity) public payable",
+  ];
+
+  const remoteAbi = await fetchAbiFromExplorer(contractAddress);
+  const quantitiesToTry = [1, 2, 3, 5]; // safer small quantities for direct mint
+
+  let anySuccess = false;
+
+  for (const wallet of mintWallets) {
+    const connectedSigner = wallet.signer.connect(provider);
+    const candidates = [];
+
+    // Prefer verified ABI from explorer if available
+    if (remoteAbi) {
+      candidates.push(
+        new ethers.Contract(contractAddress, remoteAbi, connectedSigner),
+      );
+    }
+
+    // Always also try common ABIs
+    candidates.push(
+      new ethers.Contract(contractAddress, EXTRA_MINT_ABIS, connectedSigner),
+    );
+
+    const overrideValue = process.env.MINT_VALUE_ETH
+      ? ethers.parseEther(process.env.MINT_VALUE_ETH)
+      : 0n;
+
+    let walletSuccess = false;
+
+    for (const contract of candidates) {
+      const attempts = [];
+
+      // Build a list of possible calls
+      for (const qty of quantitiesToTry) {
+        attempts.push(() => contract.mint({ value: overrideValue }));
+        attempts.push(() => contract.mint(qty, { value: overrideValue }));
+        attempts.push(() =>
+          contract.mint(wallet.address, { value: overrideValue }),
         );
+        attempts.push(() =>
+          contract.mint(wallet.address, qty, { value: overrideValue }),
+        );
+        attempts.push(() => contract.publicMint({ value: overrideValue }));
+        attempts.push(() => contract.publicMint(qty, { value: overrideValue }));
+        attempts.push(() => contract.claim({ value: overrideValue }));
+        attempts.push(() => contract.claim(qty, { value: overrideValue }));
+        attempts.push(() =>
+          contract.claim(wallet.address, qty, { value: overrideValue }),
+        );
+        attempts.push(() =>
+          contract.safeMint(wallet.address, { value: overrideValue }),
+        );
+        attempts.push(() =>
+          contract.safeMint(wallet.address, qty, { value: overrideValue }),
+        );
+        attempts.push(() => contract.mintNFT(qty, { value: overrideValue }));
+        attempts.push(() => contract.mintPublic(qty, { value: overrideValue }));
       }
+
+      for (const attempt of attempts) {
+        try {
+          const tx = await attempt();
+          const receipt = await tx.wait();
+
+          if (receipt.status === 1) {
+            await notify(
+              `✅ <b>Direct mint SUCCESS</b>\n` +
+                `Wallet: <code>${escapeHtml(wallet.address)}</code>\n` +
+                `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+                `Tx: <code>${escapeHtml(tx.hash)}</code>`,
+            );
+            walletSuccess = true;
+            anySuccess = true;
+            break;
+          }
+        } catch (err) {
+          // try next pattern
+          continue;
+        }
+      }
+
+      if (walletSuccess) break;
+    }
+
+    if (!walletSuccess) {
+      await notify(
+        `❌ Direct mint failed for wallet <code>${escapeHtml(wallet.address.slice(0, 10))}...</code>`,
+      );
     }
   }
-  if (candidates.length === 0) {
-    candidates.push(
-      new ethers.Contract(contractAddress, COMMON_MINT_ABIS, connectedSigner),
+
+  if (!anySuccess) {
+    await notify(
+      `⚠️ <code>${escapeHtml(sourceWallet)}</code> minted from <code>${escapeHtml(contractAddress)}</code>\n` +
+        `Could not find a working mint function automatically.\n` +
+        `This collection likely needs allowlist/signature or a custom mint method.`,
     );
   }
-
-  const overrideValue = process.env.MINT_VALUE_ETH
-    ? ethers.parseEther(process.env.MINT_VALUE_ETH)
-    : 0n;
-
-  for (const contract of candidates) {
-    for (const attempt of [
-      () => contract.mint({ value: overrideValue }),
-      () => contract.mint(MINT_QUANTITY, { value: overrideValue }),
-      () =>
-        contract.mint(WALLET_ADDRESS, MINT_QUANTITY, { value: overrideValue }),
-      () => contract.publicMint(MINT_QUANTITY, { value: overrideValue }),
-      () => contract.claim(MINT_QUANTITY, { value: overrideValue }),
-    ]) {
-      try {
-        const tx = await attempt();
-        const receipt = await tx.wait();
-        const ok = receipt.status === 1;
-        console.log(
-          ok
-            ? `[mint][fallback] ✓ confirmed, tx ${tx.hash}`
-            : `[mint][fallback] ✗ reverted, tx ${tx.hash}`,
-        );
-        await notify(
-          ok
-            ? `✅ <b>Copied mint</b> (direct, no OpenSea Drop) from <code>${escapeHtml(contractAddress)}</code>\nTx: <code>${escapeHtml(tx.hash)}</code>`
-            : `⚠️ Direct mint reverted for <code>${escapeHtml(contractAddress)}</code>\nTx: <code>${escapeHtml(tx.hash)}</code>`,
-        );
-        return;
-      } catch (err) {
-        continue;
-      }
-    }
-  }
-
-  console.error(
-    `[mint][fallback] Could not find a working mint function for ${contractAddress}.`,
-  );
-  await notify(
-    `⚠️ <code>${escapeHtml(sourceWallet)}</code> minted from <code>${escapeHtml(contractAddress)}</code> (no OpenSea Drop) — ` +
-      `couldn't find a working mint function automatically. Manual review needed.`,
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -563,126 +820,194 @@ async function attemptDirectMint(contractAddress, sourceWallet) {
 // ---------------------------------------------------------------------------
 
 async function copyMint(contractAddress, sourceTxHash, sourceWallet) {
+  if (isPaused) {
+    await notify(`⏸ Mint detected but bot is paused. Skipping.`);
+    return;
+  }
+
   console.log(
     `\n[mint detected] wallet=${sourceWallet} contract=${contractAddress} source_tx=${sourceTxHash}`,
   );
 
-  await notify(
-    `🔔 <b>Mint detected</b>\nWallet: <code>${escapeHtml(sourceWallet)}</code>\nContract: <code>${escapeHtml(contractAddress)}</code>\nTx: <code>${escapeHtml(sourceTxHash)}</code>`,
-  );
+  // Detect quantity
+  let detectedQty = 1;
+  try {
+    const provider = rpcPool.current();
+    const receipt = await provider.getTransactionReceipt(sourceTxHash);
+    if (receipt?.logs) {
+      let count = 0;
+      for (const log of receipt.logs) {
+        if (
+          log.topics.length >= 3 &&
+          log.topics[0] === ERC721_TRANSFER_TOPIC &&
+          log.topics[1] === ethers.zeroPadValue(NULL_ADDRESS, 32)
+        ) {
+          const toAddress = ("0x" + log.topics[2].slice(26)).toLowerCase();
+          if (toAddress === sourceWallet.toLowerCase()) count++;
+        }
+      }
+      if (count > 0) detectedQty = count;
+    }
+  } catch (err) {
+    console.warn(`[mint] quantity detect failed: ${err.message}`);
+  }
 
-  let slug;
+  // Quantity list
+  let quantityTries = (process.env.QUANTITY_TRIES || "10,5,3,2,1")
+    .split(",")
+    .map((n) => Number(n.trim()))
+    .filter((n) => n > 0);
+
+  if (!quantityTries.includes(detectedQty)) quantityTries.push(detectedQty);
+  quantityTries = [...new Set(quantityTries)].sort((a, b) => b - a);
+
+  // Resolve collection
+  let slug = null;
   try {
     slug = await resolveCollectionSlug(contractAddress);
   } catch (err) {
-    console.warn(
-      `[opensea] contract lookup failed: ${err.message}. Falling back to direct mint.`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet);
-  }
-  if (!slug) {
-    console.warn(
-      `[opensea] ${contractAddress} isn't attached to an OpenSea collection. Falling back to direct mint.`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet);
-  }
-
-  let raw;
-  try {
-    raw = await buildDropMintTransaction(
-      slug,
-      DRY_RUN ? WALLET_ADDRESS || ethers.ZeroAddress : WALLET_ADDRESS,
-      MINT_QUANTITY,
-    );
-  } catch (err) {
-    console.warn(
-      `[opensea] drops mint-build failed for "${slug}": ${err.message}. Falling back to direct mint.`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet);
-  }
-
-  const { to, data, value } = readMintTxFields(raw);
-  if (!to || !data) {
-    console.warn(
-      `[opensea] mint-build response missing to/data for "${slug}". Falling back to direct mint.`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet);
-  }
-
-  const valueWei = BigInt(value || "0");
-  const valueEth = ethers.formatEther(valueWei);
-
-  if (MAX_PRICE_ETH !== null && Number(valueEth) > MAX_PRICE_ETH) {
-    console.warn(
-      `[skip] "${slug}" costs ${valueEth} ETH, above MAX_PRICE_ETH=${MAX_PRICE_ETH}. Skipping.`,
-    );
     await notify(
-      `⏭ Skipped <code>${escapeHtml(slug)}</code> — costs ${valueEth} ETH, above your MAX_PRICE_ETH cap.`,
+      `🔔 <b>Mint detected</b>\n` +
+        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `⚠️ OpenSea lookup failed → trying direct mint`,
     );
-    return;
+    return attemptDirectMint(contractAddress, sourceWallet);
   }
 
-  console.log(
-    `[mint] collection=${slug} target=${to} value=${valueEth} ETH quantity=${MINT_QUANTITY}`,
+  if (!slug) {
+    await notify(
+      `🔔 <b>Mint detected</b>\n` +
+        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `⚠️ No OpenSea Drop found → trying direct mint`,
+    );
+    return attemptDirectMint(contractAddress, sourceWallet);
+  }
+
+  // Initial summary message
+  await notify(
+    `🔔 <b>Mint detected</b>\n` +
+      `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+      `Collection: <code>${escapeHtml(slug)}</code>\n` +
+      `Detected qty: <b>${detectedQty}</b>\n` +
+      `Trying quantities: <b>${quantityTries.join(", ")}</b>\n` +
+      `Wallets: <b>${wallets.length || 1}</b>`,
   );
 
-  if (DRY_RUN) {
-    console.log(
-      "[dry-run] Would send this transaction now — nothing broadcast.",
-    );
-    await notify(
-      `🧪 <b>Dry run</b>: would mint <code>${escapeHtml(slug)}</code> for ${valueEth} ETH (not broadcast).`,
-    );
+  const mintWallets = DRY_RUN
+    ? [{ address: wallets[0]?.address || WALLET_ADDRESS || ethers.ZeroAddress }]
+    : wallets;
+
+  if (mintWallets.length === 0) {
+    await notify(`❌ No minting wallets configured`);
     return;
   }
 
-  try {
-    const provider = rpcPool.current();
-    const connectedSigner = signer.connect(provider);
-    const balance = await provider.getBalance(WALLET_ADDRESS);
-    const gasEstimate = await provider.estimateGas({
-      to,
-      data,
-      value: valueWei,
-      from: WALLET_ADDRESS,
-    });
-    const feeData = await provider.getFeeData();
-    const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
-    const totalCost = valueWei + gasEstimate * gasPrice;
+  let successCount = 0;
+  const results = [];
 
-    if (balance < totalCost) {
-      const msg = `Wallet balance ${ethers.formatEther(balance)} ETH is below estimated cost ~${ethers.formatEther(totalCost)} ETH.`;
-      console.error(`[mint] ${msg}`);
-      await notify(
-        `❌ Couldn't mint <code>${escapeHtml(slug)}</code> — ${escapeHtml(msg)}`,
-      );
-      return;
+  for (const wallet of mintWallets) {
+    let walletSuccess = false;
+    let lastError = "";
+
+    for (const qty of quantityTries) {
+      let raw;
+      try {
+        raw = await buildDropMintTransaction(slug, wallet.address, qty);
+      } catch (err) {
+        lastError = err.message || "OpenSea build failed";
+        continue;
+      }
+
+      const { to, data, value } = readMintTxFields(raw);
+      if (!to || !data) {
+        lastError = "Invalid transaction data from OpenSea";
+        continue;
+      }
+
+      const valueWei = BigInt(value || "0");
+      const valueEth = Number(ethers.formatEther(valueWei));
+
+      if (MAX_PRICE_ETH !== null && valueEth > MAX_PRICE_ETH) {
+        lastError = `Price ${valueEth} ETH above limit`;
+        continue;
+      }
+
+      if (DRY_RUN) {
+        results.push(
+          `🧪 Dry run: would mint ${qty} with ${wallet.address.slice(0, 10)}... (${valueEth} ETH)`,
+        );
+        walletSuccess = true;
+        successCount++;
+        break;
+      }
+
+      // Real mint
+      try {
+        const provider = rpcPool.current();
+        const connectedSigner = wallet.signer.connect(provider);
+
+        const balance = await provider.getBalance(wallet.address);
+        const gasEstimate = await provider.estimateGas({
+          to,
+          data,
+          value: valueWei,
+          from: wallet.address,
+        });
+        const feeData = await provider.getFeeData();
+        const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
+        const totalCost = valueWei + gasEstimate * gasPrice;
+
+        if (balance < totalCost) {
+          lastError = `Insufficient balance (need ~${ethers.formatEther(totalCost)} ETH)`;
+          continue;
+        }
+
+        const tx = await connectedSigner.sendTransaction({
+          to,
+          data,
+          value: valueWei,
+        });
+        const receipt = await tx.wait();
+
+        if (receipt.status === 1) {
+          results.push(
+            `✅ ${wallet.address.slice(0, 10)}... minted ${qty} | Tx: ${tx.hash.slice(0, 12)}...`,
+          );
+          walletSuccess = true;
+          successCount++;
+          break;
+        } else {
+          lastError = `Transaction reverted`;
+        }
+      } catch (err) {
+        lastError = err.message || "Send failed";
+        continue;
+      }
     }
 
-    const tx = await connectedSigner.sendTransaction({
-      to,
-      data,
-      value: valueWei,
-    });
-    console.log(`[mint] sent tx ${tx.hash}, waiting for confirmation...`);
-    const receipt = await tx.wait();
-    const ok = receipt.status === 1;
-    console.log(
-      ok
-        ? `[mint] ✓ confirmed in block ${receipt.blockNumber}`
-        : `[mint] ✗ reverted`,
-    );
-    await notify(
-      ok
-        ? `✅ <b>Minted</b> <code>${escapeHtml(slug)}</code>!\nBlock: ${receipt.blockNumber}\nTx: <code>${escapeHtml(tx.hash)}</code>`
-        : `⚠️ Mint reverted for <code>${escapeHtml(slug)}</code>\nTx: <code>${escapeHtml(tx.hash)}</code>`,
-    );
-  } catch (err) {
-    console.error(`[mint] send failed: ${err.message}`);
-    await notify(
-      `❌ Mint failed for <code>${escapeHtml(slug)}</code>: ${escapeHtml(err.message)}`,
-    );
+    if (!walletSuccess) {
+      results.push(
+        `❌ ${wallet.address.slice(0, 10)}... failed → ${lastError.slice(0, 80)}`,
+      );
+    }
   }
+
+  // Final summary message
+  let summary =
+    `📋 <b>Result for</b> <code>${escapeHtml(slug)}</code>\n` +
+    `Success: <b>${successCount}/${mintWallets.length}</b> wallets\n\n`;
+
+  summary += results.join("\n");
+
+  if (successCount === 0) {
+    summary += `\n\n⚠️ All OpenSea attempts failed. Trying direct mint fallback...`;
+    await notify(summary);
+    return attemptDirectMint(contractAddress, sourceWallet);
+  }
+
+  await notify(summary);
 }
 
 // ---------------------------------------------------------------------------
@@ -729,18 +1054,31 @@ async function pollLoop() {
     lastCheckedBlock = await getLatestBlock();
     console.log(`[init] starting from block ${lastCheckedBlock}`);
   }
+
   try {
     const latest = await getLatestBlock();
+
     if (latest > lastCheckedBlock) {
-      const mints = await findMintsInRange(lastCheckedBlock + 1, latest);
+      // Only check a limited number of blocks at a time (important fix)
+      const MAX_BLOCKS_PER_SCAN = 1000;
+      const toBlock = Math.min(lastCheckedBlock + MAX_BLOCKS_PER_SCAN, latest);
+
+      console.log(
+        `[poll] scanning blocks ${lastCheckedBlock + 1} → ${toBlock}`,
+      );
+
+      const mints = await findMintsInRange(lastCheckedBlock + 1, toBlock);
+
       for (const mint of mints) {
         await copyMint(mint.contractAddress, mint.txHash, mint.wallet);
       }
-      lastCheckedBlock = latest;
+
+      lastCheckedBlock = toBlock;
     }
   } catch (err) {
     console.error(`[poll] ${err.message}`);
   }
+
   setTimeout(pollLoop, POLL_INTERVAL_MS);
 }
 
