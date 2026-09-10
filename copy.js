@@ -1600,7 +1600,7 @@ async function main() {
       `Poll: <b>${POLL_INTERVAL_MS}ms</b>\n\n` +
       `🟢 Robinhood: <b>${chainConfigs.robinhood.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.robinhood.dryRun})\n` +
       `🟦 Ethereum: <b>${chainConfigs.ethereum.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.ethereum.dryRun})\n` +
-      `🟪 Ink: <b>${chainConfigs.ink.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.ink.dryRun})\n` +
+      `💜 Ink: <b>${chainConfigs.ink.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.ink.dryRun})\n` +
       `⬜ ARC: <b>${chainConfigs.arc.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.arc.dryRun})\n\n` +
       `Stage 1: multi-chain foundation loaded.\n` +
       `Robinhood minting still active as before.`,
