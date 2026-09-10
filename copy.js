@@ -377,6 +377,7 @@ let watchedWallets = [];
 let isPaused = false; // when true, bot detects but does not mint
 let isRhPaused = false;
 let isEthPaused = false;
+let isInkPaused = false;
 
 // ===== Stats + already-minted protection =====
 const successfulMints = new Set(); // contract addresses already successfully minted
@@ -431,9 +432,10 @@ async function notify(text) {
 // ===== BUTTON MENU =====
 const mainMenu = Markup.keyboard([
   ["📊 Status", "👛 Wallets"],
-  ["💰 RH Balances", "💎 ETH Balances"],
+  ["💰 RH Balances", "💎 ETH Balances", "💜 Ink Balances"],
   ["⏸ Pause RH", "▶️ Resume RH"],
   ["⏸ Pause ETH", "▶️ Resume ETH"],
+  ["⏸ Pause Ink", "▶️ Resume Ink"],
   ["⏸ Pause All", "▶️ Resume All"],
   ["ℹ️ Help"],
 ]).resize();
@@ -486,6 +488,11 @@ bot.hears("📊 Status", async (ctx) => {
     `Mode: <b>${ethMode}</b>\n` +
     `Enabled: <b>${chainConfigs.ethereum.enabled ? "ON" : "OFF"}</b>\n` +
     `Max price: <b>${chainConfigs.ethereum.maxPriceEth ?? "not set"}</b>\n\n` +
+    `💜 <b>Ink</b>\n` +
+    `State: <b>${isInkPaused ? "⏸ Paused" : "▶️ Running"}</b>\n` +
+    `Mode: <b>${chainConfigs.ink.dryRun ? "🧪 Dry Run" : "🔥 Live"}</b>\n` +
+    `Enabled: <b>${chainConfigs.ink.enabled ? "ON" : "OFF"}</b>\n` +
+    `Max price: <b>${chainConfigs.ink.maxPriceEth ?? "not set"}</b>\n\n` +
     `🔢 Quantities: <b>${process.env.QUANTITY_TRIES || "10,5,3,2,1"}</b>`;
 
   await ctx.reply(message, { parse_mode: "HTML" });
@@ -578,11 +585,24 @@ bot.hears("▶️ Resume ETH", async (ctx) => {
   await ctx.reply("▶️ Ethereum resumed");
 });
 
+bot.hears("⏸ Pause Ink", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  isInkPaused = true;
+  await ctx.reply("⏸ Ink paused");
+});
+
+bot.hears("▶️ Resume Ink", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  isInkPaused = false;
+  await ctx.reply("▶️ Ink resumed");
+});
+
 bot.hears("⏸ Pause All", async (ctx) => {
   if (!isAuthorizedChat(ctx)) return;
   isPaused = true;
   isRhPaused = true;
   isEthPaused = true;
+  isInkPaused = true;
   await ctx.reply("⏸ All minting paused");
 });
 
@@ -591,6 +611,7 @@ bot.hears("▶️ Resume All", async (ctx) => {
   isPaused = false;
   isRhPaused = false;
   isEthPaused = false;
+  isInkPaused = false;
   await ctx.reply("▶️ All minting resumed");
 });
 
@@ -626,6 +647,26 @@ bot.hears("💎 ETH Balances", async (ctx) => {
     await ctx.reply(message, { parse_mode: "HTML" });
   } catch (err) {
     await ctx.reply(`❌ ETH balances failed: ${err.message}`);
+  }
+});
+
+bot.hears("💜 Ink Balances", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  try {
+    if (!inkRpcPool) {
+      return ctx.reply("Ink RPC not ready (is INK_ENABLED=true and RPCs set?)");
+    }
+    const provider = inkRpcPool.current();
+    const list = wallets.length > 0 ? wallets : [{ address: WALLET_ADDRESS }];
+    let message = `💜 <b>Ink balances</b>\n\n`;
+    for (const w of list) {
+      const balance = await provider.getBalance(w.address);
+      const eth = Number(ethers.formatEther(balance)).toFixed(5);
+      message += `<code>${escapeHtml(w.address.slice(0, 10))}...</code> → <b>${eth}</b>\n`;
+    }
+    await ctx.reply(message, { parse_mode: "HTML" });
+  } catch (err) {
+    await ctx.reply(`❌ Ink balances failed: ${err.message}`);
   }
 });
 // ===== END BUTTON MENU =====
@@ -743,6 +784,11 @@ bot.command("status", async (ctx) => {
     `Mode: <b>${ethMode}</b>\n` +
     `Enabled: <b>${chainConfigs.ethereum.enabled ? "ON" : "OFF"}</b>\n` +
     `Max price: <b>${chainConfigs.ethereum.maxPriceEth ?? "not set"}</b>\n\n` +
+    `💜 <b>Ink</b>\n` +
+    `State: <b>${isInkPaused ? "⏸ Paused" : "▶️ Running"}</b>\n` +
+    `Mode: <b>${chainConfigs.ink.dryRun ? "🧪 Dry Run" : "🔥 Live"}</b>\n` +
+    `Enabled: <b>${chainConfigs.ink.enabled ? "ON" : "OFF"}</b>\n` +
+    `Max price: <b>${chainConfigs.ink.maxPriceEth ?? "not set"}</b>\n\n` +
     `🔢 Quantities: <b>${process.env.QUANTITY_TRIES || "10,5,3,2,1"}</b>`;
 
   await ctx.reply(message, { parse_mode: "HTML" });
@@ -866,7 +912,6 @@ const inkRpcPool =
 
 let inkLastCheckedBlock = null;
 const inkSeenTxHashes = new Set();
-let isInkPaused = false;
 // ===== End Ink RPC pool =====
 
 // ---------------------------------------------------------------------------
@@ -924,10 +969,22 @@ async function buildDropMintTransaction(slug, minter, quantity) {
 // Fallback: direct on-chain mint when there's no OpenSea Drop
 // ---------------------------------------------------------------------------
 
-async function fetchAbiFromExplorer(contractAddress) {
-  const url = `${EXPLORER_API_BASE}/smart-contracts/${contractAddress}${
-    EXPLORER_API_KEY ? `?apikey=${EXPLORER_API_KEY}` : ""
+async function fetchAbiFromExplorer(
+  contractAddress,
+  explorerBase,
+  explorerKey = "",
+) {
+  if (!explorerBase) {
+    console.warn("[explorer] No explorer API base configured");
+    return null;
+  }
+
+  // Note: This path works for Blockscout-style explorers (Robinhood + Ink).
+  // Etherscan uses a different format, so Ethereum fallback may still fail for now.
+  const url = `${explorerBase}/smart-contracts/${contractAddress}${
+    explorerKey ? `?apikey=${explorerKey}` : ""
   }`;
+
   try {
     const res = await fetchWithTimeout(url, {}, 10000);
     if (!res.ok) return null;
@@ -948,8 +1005,24 @@ function abiHasFunction(abi, name) {
   );
 }
 
-async function attemptDirectMint(contractAddress, sourceWallet) {
-  if (DRY_RUN) {
+async function attemptDirectMint(
+  contractAddress,
+  sourceWallet,
+  chainName = "robinhood",
+) {
+  const chain = chainConfigs[chainName] || chainConfigs.robinhood;
+
+  const activeRpcPool =
+    chainName === "ethereum"
+      ? ethRpcPool
+      : chainName === "ink"
+        ? inkRpcPool
+        : rpcPool;
+
+  const activeDryRun = chain.dryRun;
+  const explorerBase = chain.explorerApiBase;
+  const explorerKey = chain.explorerApiKey || "";
+  if (activeDryRun) {
     await notify(
       `⚙️ <b>Direct mint fallback</b>\n` +
         `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
@@ -963,7 +1036,11 @@ async function attemptDirectMint(contractAddress, sourceWallet) {
     return;
   }
 
-  const provider = rpcPool.current();
+  if (!activeRpcPool) {
+    await notify(`❌ No RPC pool ready for ${chainName}`);
+    return;
+  }
+  const provider = activeRpcPool.current();
   const mintWallets =
     wallets.length > 0
       ? wallets
@@ -985,7 +1062,11 @@ async function attemptDirectMint(contractAddress, sourceWallet) {
     "function mintPublic(uint256 quantity) public payable",
   ];
 
-  const remoteAbi = await fetchAbiFromExplorer(contractAddress);
+  const remoteAbi = await fetchAbiFromExplorer(
+    contractAddress,
+    explorerBase,
+    explorerKey,
+  );
   const quantitiesToTry = [1, 2, 3, 5];
   const results = [];
   let anySuccess = false;
@@ -1203,7 +1284,7 @@ async function copyMint(
         `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
         `⚠️ OpenSea lookup failed → trying direct mint`,
     );
-    return attemptDirectMint(contractAddress, sourceWallet);
+    return attemptDirectMint(contractAddress, sourceWallet, chainName);
   }
 
   if (!slug) {
@@ -1213,7 +1294,7 @@ async function copyMint(
         `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
         `⚠️ No OpenSea Drop found → trying direct mint`,
     );
-    return attemptDirectMint(contractAddress, sourceWallet);
+    return attemptDirectMint(contractAddress, sourceWallet, chainName);
   }
 
   // Initial summary message
@@ -1341,7 +1422,7 @@ async function copyMint(
     dailyStats.failed += 1;
     summary += `\n\n⚠️ All OpenSea attempts failed. Trying direct mint fallback...`;
     await notify(summary);
-    return attemptDirectMint(contractAddress, sourceWallet);
+    return attemptDirectMint(contractAddress, sourceWallet, chainName);
   }
 
   await notify(summary);
@@ -1598,7 +1679,7 @@ async function main() {
     `🤖 <b>Bot started</b>\n` +
       `Watched wallets: <b>${watchedWallets.length}</b>\n` +
       `Poll: <b>${POLL_INTERVAL_MS}ms</b>\n\n` +
-      `🟨 Robinhood: <b>${chainConfigs.robinhood.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.robinhood.dryRun})\n` +
+      `🟢 Robinhood: <b>${chainConfigs.robinhood.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.robinhood.dryRun})\n` +
       `🟦 Ethereum: <b>${chainConfigs.ethereum.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.ethereum.dryRun})\n` +
       `💜 Ink: <b>${chainConfigs.ink.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.ink.dryRun})\n` +
       `⬜ ARC: <b>${chainConfigs.arc.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.arc.dryRun})\n\n` +
