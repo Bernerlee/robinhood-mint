@@ -1637,3 +1637,8 @@ async function main() {
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
