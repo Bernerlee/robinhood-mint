@@ -384,6 +384,10 @@ let isArcPaused = false;
 // Telegram interactive flows
 let pendingFundGas = null; // null | { step, chain? }
 let pendingCollect = null; // null | { step, chain?, contract?, to? }
+let pendingOffers = null; // null | { step, chain?, contract?, min? }
+let pendingAcceptOffers = null; // null | { matches: [...], chainKey, contract }
+let pendingSchedule = null; // interactive flow
+let armedMints = []; // { id, chainKey, slug, contract, stage, qty, fireAt, timer }
 
 // ===== Stats + already-minted protection =====
 // Track successful mints per contract+wallet so failed wallets can retry later
@@ -463,6 +467,44 @@ async function saveDailyStats() {
 }
 // ===== End stats =====
 
+async function dbSaveArmedMint(job) {
+  const { error } = await supabase.from("armed_mints").upsert({
+    id: job.id,
+    chain_key: job.chainKey,
+    slug: job.slug,
+    contract: job.contract,
+    stage_label: job.stageLabel,
+    qty: job.qty,
+    expected_total_wei: String(job.expectedTotalWei ?? "0"),
+    fire_at: new Date(job.fireAt).toISOString(),
+    status: "armed",
+  });
+  if (error) throw new Error(`save armed mint: ${error.message}`);
+}
+
+async function dbMarkArmedDone(id, status = "done") {
+  const { error } = await supabase
+    .from("armed_mints")
+    .update({ status })
+    .eq("id", id);
+  if (error) console.error(`[armed] mark ${status} failed: ${error.message}`);
+}
+
+async function dbDeleteArmedMint(id) {
+  const { error } = await supabase.from("armed_mints").delete().eq("id", id);
+  if (error) console.error(`[armed] delete failed: ${error.message}`);
+}
+
+async function dbListArmedMints() {
+  const { data, error } = await supabase
+    .from("armed_mints")
+    .select("*")
+    .eq("status", "armed")
+    .order("fire_at", { ascending: true });
+  if (error) throw new Error(`list armed mints: ${error.message}`);
+  return data || [];
+}
+
 async function refreshWatchedWallets() {
   try {
     watchedWallets = await dbListWallets();
@@ -525,6 +567,44 @@ function getChainRpcPool(chainKey) {
   };
 }
 
+async function getEthPriceUsd() {
+  // Free public price feed (no key)
+  const url =
+    "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
+  const res = await fetchWithTimeout(url, {}, 8000);
+  if (!res.ok) throw new Error(`Price API HTTP ${res.status}`);
+  const data = await res.json();
+  const price = Number(data?.ethereum?.usd);
+  if (!Number.isFinite(price) || price <= 0)
+    throw new Error("Invalid ETH price");
+  return price;
+}
+
+function parseFundAmount(amountStr, chainKey) {
+  const raw = String(amountStr || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) throw new Error("empty");
+
+  // $3 / 3$ / 3usd / usd3
+  const usdMatch =
+    raw.match(/^\$\s*([0-9]*\.?[0-9]+)$/) ||
+    raw.match(/^([0-9]*\.?[0-9]+)\s*\$$/) ||
+    raw.match(/^([0-9]*\.?[0-9]+)\s*usd$/) ||
+    raw.match(/^usd\s*([0-9]*\.?[0-9]+)$/);
+
+  if (usdMatch) {
+    const usd = Number(usdMatch[1]);
+    if (!Number.isFinite(usd) || usd <= 0) throw new Error("bad usd");
+    return { type: "usd", usd };
+  }
+
+  // plain number = native token amount (ETH or USDC on Arc)
+  const native = Number(raw);
+  if (!Number.isFinite(native) || native <= 0) throw new Error("bad amount");
+  return { type: "native", amount: native };
+}
+
 function parseChainKey(text) {
   const t = String(text || "")
     .trim()
@@ -545,20 +625,55 @@ async function runFundGas(ctx, amountStr, chainKey = "rh") {
       return ctx.reply("❌ No minting wallets loaded.");
     }
 
-    let amountEth;
+    const { pool, label } = getChainRpcPool(chainKey);
+    const isArc = String(chainKey).toLowerCase() === "arc";
+    const tokenName = isArc ? "USDC" : "ETH";
+
+    let amountEth; // native amount to send (ETH or USDC units)
+    let usdNote = "";
+
     try {
-      amountEth = Number(amountStr);
+      const parsed = parseFundAmount(amountStr, chainKey);
+
+      if (parsed.type === "usd") {
+        if (isArc) {
+          // Arc native gas token is USDC ≈ $1
+          amountEth = parsed.usd;
+          usdNote = ` (≈ $${parsed.usd} USDC)`;
+        } else {
+          const ethPrice = await getEthPriceUsd();
+          amountEth = parsed.usd / ethPrice;
+          usdNote = ` ($${parsed.usd} ≈ ${amountEth.toFixed(6)} ETH @ $${ethPrice.toFixed(2)})`;
+        }
+      } else {
+        amountEth = parsed.amount;
+      }
+
       if (!Number.isFinite(amountEth) || amountEth <= 0)
         throw new Error("bad amount");
-    } catch {
-      return ctx.reply("❌ Invalid amount. Example: 0.002");
+    } catch (err) {
+      return ctx.reply(
+        "❌ Invalid amount.\n\n" +
+          "Examples:\n" +
+          "• <code>0.002</code> (native)\n" +
+          "• <code>$3</code> (dollars)\n" +
+          "• <code>3usd</code>\n\n" +
+          `Error: ${escapeHtml(err.message)}`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    // safety cap for accidental huge USD → ETH conversions
+    if (!isArc && amountEth > 0.2) {
+      return ctx.reply(
+        `❌ Amount too high for safety: <b>${amountEth.toFixed(6)} ETH</b>${usdNote}\n` +
+          `Max allowed per wallet: 0.2 ETH. Try a smaller $ amount.`,
+        { parse_mode: "HTML" },
+      );
     }
 
     const amountWei = ethers.parseEther(String(amountEth));
     const totalNeeded = amountWei * BigInt(wallets.length);
-
-    const { pool, label } = getChainRpcPool(chainKey);
-    const tokenName = String(chainKey).toLowerCase() === "arc" ? "USDC" : "ETH";
     const provider = pool.current();
     const funder = sponsorWallet.signer.connect(provider);
 
@@ -572,7 +687,7 @@ async function runFundGas(ctx, amountStr, chainKey = "rh") {
     }
 
     await ctx.reply(
-      `⛽ Sending <b>${amountEth}</b> ${tokenName} on <b>${label}</b> to <b>${wallets.length}</b> wallets...\n` +
+      `⛽ Sending <b>${Number(amountEth).toFixed(6)}</b> ${tokenName} on <b>${label}</b> to <b>${wallets.length}</b> wallets...${usdNote}\n` +
         `From: <code>${escapeHtml(sponsorWallet.address.slice(0, 12))}...</code>`,
       { parse_mode: "HTML" },
     );
@@ -616,6 +731,915 @@ const ERC721_ABI = [
   "function safeTransferFrom(address from, address to, uint256 tokenId)",
   "function transferFrom(address from, address to, uint256 tokenId)",
 ];
+
+function parsePriceInput(str) {
+  const raw = String(str || "")
+    .trim()
+    .toLowerCase();
+  if (!raw || raw === "none" || raw === "-") return null;
+
+  const usdMatch =
+    raw.match(/^\$\s*([0-9]*\.?[0-9]+)$/) ||
+    raw.match(/^([0-9]*\.?[0-9]+)\s*\$$/) ||
+    raw.match(/^([0-9]*\.?[0-9]+)\s*usd$/);
+
+  if (usdMatch) {
+    const usd = Number(usdMatch[1]);
+    if (!Number.isFinite(usd) || usd < 0) throw new Error("bad usd price");
+    return { kind: "usd", value: usd };
+  }
+
+  const native = Number(raw);
+  if (!Number.isFinite(native) || native < 0) throw new Error("bad price");
+  return { kind: "native", value: native };
+}
+
+function offerPriceToNativeAndUsd(offer) {
+  if (!offer || typeof offer !== "object") return null;
+
+  const price = offer.price || offer.current_price || {};
+  const currency = String(
+    price.currency ||
+      price.payment_token?.symbol ||
+      offer.payment_token?.symbol ||
+      "ETH",
+  ).toUpperCase();
+
+  const decimals = Number(
+    price.decimals ??
+      price.payment_token?.decimals ??
+      offer.payment_token?.decimals ??
+      18,
+  );
+
+  // Common OpenSea shapes
+  let raw =
+    price.value ??
+    price.current_price ??
+    price.amount ??
+    offer.current_price ??
+    offer.amount ??
+    null;
+
+  // Sometimes nested as { value: { raw/value } }
+  if (raw && typeof raw === "object") {
+    raw = raw.raw ?? raw.value ?? raw.amount ?? null;
+  }
+
+  // Seaport protocol_data fallback (sum of offer item startAmounts is not ideal;
+  // for standard ETH/WETH offers, consideration often holds payment — skip if messy)
+  if (raw == null && offer.protocol_data?.parameters) {
+    const params = offer.protocol_data.parameters;
+    const consideration = params.consideration || [];
+    // For an offer, the buyer offers payment tokens in "offer" array
+    const offerItems = params.offer || [];
+    const paymentItem =
+      offerItems.find((i) => String(i.itemType) === "1" || i.itemType === 1) ||
+      offerItems[0];
+    if (paymentItem?.startAmount) raw = paymentItem.startAmount;
+  }
+
+  if (raw == null) return null;
+
+  let native = NaN;
+  if (typeof raw === "string") {
+    if (/^\d+$/.test(raw)) {
+      // integer wei-like
+      try {
+        native = Number(ethers.formatUnits(raw, decimals));
+      } catch {
+        native = Number(raw);
+      }
+    } else {
+      native = Number(raw);
+    }
+  } else if (typeof raw === "number") {
+    // large number likely wei
+    if (raw > 1e10) {
+      try {
+        native = Number(ethers.formatUnits(BigInt(Math.trunc(raw)), decimals));
+      } catch {
+        native = raw;
+      }
+    } else {
+      native = raw;
+    }
+  } else if (typeof raw === "bigint") {
+    native = Number(ethers.formatUnits(raw, decimals));
+  }
+
+  if (!Number.isFinite(native) || native < 0) return null;
+
+  const usd =
+    price.usd != null
+      ? Number(price.usd)
+      : price.value_usd != null
+        ? Number(price.value_usd)
+        : offer.price?.usd != null
+          ? Number(offer.price.usd)
+          : null;
+
+  return {
+    native,
+    usd: Number.isFinite(usd) ? usd : null,
+    currency,
+    raw: String(raw),
+  };
+}
+
+function openseaChainName(chainKey) {
+  const k = String(chainKey || "").toLowerCase();
+  if (k === "eth" || k === "ethereum") return "ethereum";
+  if (k === "ink") return "ink";
+  if (k === "arc") return "arc";
+  return "robinhood";
+}
+
+async function runAcceptOffers(ctx, payload) {
+  try {
+    const { matches, chainKey, contract, slug } = payload;
+    const { pool, label } = getChainRpcPool(chainKey);
+    const provider = pool.current();
+    const chainName = openseaChainName(chainKey);
+    const results = [];
+
+    await ctx.reply(
+      `💸 Accepting <b>${matches.length}</b> offer(s) on <b>${label}</b>...\n` +
+        `Collection: <code>${escapeHtml(slug)}</code>`,
+      { parse_mode: "HTML" },
+    );
+
+    for (const m of matches) {
+      try {
+        if (!m.orderHash) {
+          results.push(`❌ #${m.tokenId} missing order hash`);
+          continue;
+        }
+
+        const body = {
+          offer: {
+            hash: m.orderHash,
+            chain: chainName,
+            protocol_address: m.protocolAddress,
+          },
+          fulfiller: {
+            address: m.wallet.address,
+          },
+          consideration: {
+            asset_contract_address: contract,
+            token_id: m.tokenId,
+          },
+        };
+
+        let fulfill;
+        try {
+          fulfill = await openseaFetch("/offers/fulfillment_data", {
+            method: "POST",
+            body,
+          });
+        } catch (e1) {
+          // fallback endpoint used by some OpenSea versions
+          try {
+            fulfill = await openseaFetch("/offers/fulfillment/actions", {
+              method: "POST",
+              body,
+            });
+          } catch (e2) {
+            throw new Error(
+              `fulfillment_data: ${(e1.message || "").slice(0, 80)} | actions: ${(e2.message || "").slice(0, 80)}`,
+            );
+          }
+        }
+
+        // Dig out a sendable EVM transaction from several possible OpenSea shapes
+        const candidates = [
+          fulfill?.fulfillment_data?.transaction,
+          fulfill?.fulfillment_data?.orders?.[0]?.transaction,
+          fulfill?.transaction,
+          fulfill?.actions?.find?.((a) => a?.transaction)?.transaction,
+          fulfill?.actions?.[0]?.transaction,
+          fulfill,
+        ].filter(Boolean);
+
+        let to = null;
+        let data = null;
+        let value = 0n;
+
+        for (const c of candidates) {
+          const maybeTo = c.to || c.target || c.contract_address || null;
+          const maybeData =
+            c.data || c.input_data || c.calldata || c.input || null;
+          const maybeValue = c.value ?? c.wei_value ?? "0";
+
+          if (
+            maybeTo &&
+            typeof maybeData === "string" &&
+            maybeData.startsWith("0x")
+          ) {
+            to = maybeTo;
+            data = maybeData;
+            try {
+              value = BigInt(maybeValue || "0");
+            } catch {
+              value = 0n;
+            }
+            break;
+          }
+        }
+
+        // Some responses put calldata under seaport function call fields
+        if (!data) {
+          const fd = fulfill?.fulfillment_data || fulfill;
+          const raw =
+            fd?.transaction?.data || fd?.calldata || fd?.input_data || null;
+          if (typeof raw === "string" && raw.startsWith("0x")) {
+            data = raw;
+            to = to || fd?.transaction?.to || m.protocolAddress;
+          }
+        }
+
+        if (
+          !to ||
+          !data ||
+          typeof data !== "string" ||
+          !data.startsWith("0x")
+        ) {
+          const preview = JSON.stringify(fulfill).slice(0, 180);
+          results.push(
+            `❌ ${m.wallet.address.slice(0, 10)}... #${m.tokenId} bad fulfillment data: ${preview}`,
+          );
+          continue;
+        }
+
+        const signer = m.wallet.signer.connect(provider);
+        const tx = await signer.sendTransaction({ to, data, value });
+        const receipt = await tx.wait();
+
+        if (receipt.status === 1) {
+          results.push(
+            `✅ ${m.wallet.address.slice(0, 10)}... #${m.tokenId} accepted | ${tx.hash.slice(0, 12)}...`,
+          );
+        } else {
+          results.push(
+            `❌ ${m.wallet.address.slice(0, 10)}... #${m.tokenId} reverted`,
+          );
+        }
+      } catch (err) {
+        results.push(
+          `❌ ${m.wallet?.address?.slice(0, 10) || "?"}... #${m.tokenId} → ${(err.message || "failed").slice(0, 80)}`,
+        );
+      }
+    }
+
+    await ctx.reply(
+      `💸 <b>Accept result</b> (${label})\n\n` + results.join("\n"),
+      { parse_mode: "HTML" },
+    );
+  } catch (err) {
+    await ctx.reply(`❌ Accept failed: ${err.message}`);
+  }
+}
+
+function formatUtc(ts) {
+  if (!ts) return "unknown";
+  try {
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return String(ts);
+    return d
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d+Z$/, " UTC");
+  } catch {
+    return String(ts);
+  }
+}
+
+function formatStagePrice(priceRaw) {
+  if (priceRaw == null || priceRaw === "") return "unknown";
+  try {
+    // often wei string
+    if (typeof priceRaw === "string" && /^\d+$/.test(priceRaw)) {
+      return `${ethers.formatEther(priceRaw)} ETH`;
+    }
+    if (typeof priceRaw === "object") {
+      const v = priceRaw.value ?? priceRaw.amount ?? priceRaw.unit;
+      if (v != null && /^\d+$/.test(String(v)))
+        return `${ethers.formatEther(String(v))} ETH`;
+      return JSON.stringify(priceRaw).slice(0, 40);
+    }
+    return String(priceRaw);
+  } catch {
+    return String(priceRaw);
+  }
+}
+
+function parseStageStartMs(stage) {
+  const start = stage?.start_time || stage?.startTime || stage?.starts_at;
+  if (!start) return null;
+  const ms = new Date(start).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+async function fireArmedMint(job) {
+  try {
+    await notify(
+      `🚀 <b>Armed mint firing</b>\n` +
+        `Slug: <code>${escapeHtml(job.slug)}</code>\n` +
+        `Stage: <b>${escapeHtml(job.stageLabel)}</b>\n` +
+        `Qty: <b>${job.qty}</b>\n` +
+        `Wallets: <b>${(wallets || []).length}</b>`,
+    );
+
+    if (!wallets || wallets.length === 0) {
+      await notify("❌ No minting wallets configured");
+      return;
+    }
+
+    const { pool } = getChainRpcPool(job.chainKey);
+    const provider = pool.current();
+    const results = [];
+    let success = 0;
+
+    // Parallel wallets + retry spam per wallet (competitive drops / OpenSea errors)
+    const MAX_TRIES = Number(process.env.ARMED_MINT_TRIES || 25); // attempts per wallet
+    const RETRY_MS = Number(process.env.ARMED_MINT_RETRY_MS || 400); // pause between tries
+    const WINDOW_MS = Number(process.env.ARMED_MINT_WINDOW_MS || 45000); // stop after this long
+
+    await notify(
+      `🔁 Retry mode: <b>${MAX_TRIES}</b> tries / wallet, every <b>${RETRY_MS}ms</b>, window <b>${WINDOW_MS}ms</b>`,
+    );
+
+    const settled = await Promise.all(
+      wallets.map(async (w) => {
+        const started = Date.now();
+        let lastErr = "no attempt";
+
+        for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+          if (Date.now() - started > WINDOW_MS) {
+            lastErr = `window ${WINDOW_MS}ms expired`;
+            break;
+          }
+
+          try {
+            const raw = await buildDropMintTransaction(
+              job.slug,
+              w.address,
+              job.qty,
+            );
+            const { to, data, value } = readMintTxFields(raw);
+            if (!to || !data) {
+              lastErr = "invalid tx data";
+            } else {
+              const valueWei = BigInt(value || "0");
+              const lockedWei = BigInt(job.expectedTotalWei || "0");
+
+              if (valueWei !== lockedWei) {
+                return (
+                  `🛑 ${w.address.slice(0, 10)}... price changed ` +
+                  `(got ${ethers.formatEther(valueWei)} ETH, locked ${ethers.formatEther(lockedWei)} ETH)`
+                );
+              }
+
+              const signer = w.signer.connect(provider);
+              const tx = await signer.sendTransaction({
+                to,
+                data,
+                value: valueWei,
+              });
+              const receipt = await tx.wait();
+              if (receipt.status === 1) {
+                return `✅ ${w.address.slice(0, 10)}... qty ${job.qty} | try ${attempt} | ${tx.hash.slice(0, 12)}...`;
+              }
+              lastErr = "reverted";
+            }
+          } catch (err) {
+            lastErr = cleanOpenSeaError(err.message || "fail").slice(0, 70);
+            // stop early on clear permanent failures
+            const permanent =
+              /not eligible|not in allowlist|already minted|max.*mint|insufficient/i.test(
+                lastErr,
+              );
+            if (permanent) {
+              return `❌ ${w.address.slice(0, 10)}... ${lastErr}`;
+            }
+          }
+
+          await new Promise((r) => setTimeout(r, RETRY_MS));
+        }
+
+        return `❌ ${w.address.slice(0, 10)}... gave up → ${lastErr}`;
+      }),
+    );
+
+    for (const line of settled) {
+      results.push(line);
+      if (line.startsWith("✅")) success += 1;
+    }
+
+    await notify(
+      `📋 <b>Armed mint result</b>\n` +
+        `Success: <b>${success}/${wallets.length}</b>\n\n` +
+        results.join("\n"),
+    );
+  } catch (err) {
+    await notify(`❌ Armed mint failed: ${err.message}`);
+  }
+}
+
+function scheduleArmedTimer(job) {
+  const now = Date.now();
+  const EARLY_MS = 5000;
+  let delay = job.fireAt - EARLY_MS - now;
+  if (delay < 0) delay = 0;
+
+  const timer = setTimeout(async () => {
+    armedMints = armedMints.filter((j) => j.id !== job.id);
+    try {
+      await fireArmedMint(job);
+      await dbMarkArmedDone(job.id, "done");
+    } catch (err) {
+      console.error("[armed] fire error:", err.message);
+      await dbMarkArmedDone(job.id, "error");
+    }
+  }, delay);
+
+  armedMints.push({ ...job, timer });
+  return delay;
+}
+
+async function armMintJob(ctx, job) {
+  const id = `arm-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+  const full = { ...job, id };
+
+  try {
+    await dbSaveArmedMint(full);
+  } catch (err) {
+    return ctx.reply(`❌ Failed to save armed job: ${err.message}`);
+  }
+
+  const delay = scheduleArmedTimer(full);
+  const fireUtc = new Date(full.fireAt)
+    .toISOString()
+    .replace("T", " ")
+    .replace(/\.\d+Z$/, " UTC");
+  const inMin = Math.round(delay / 60000);
+
+  return ctx.reply(
+    `✅ <b>Armed</b> (saved)\n` +
+      `Id: <code>${escapeHtml(id)}</code>\n` +
+      `Slug: <code>${escapeHtml(full.slug)}</code>\n` +
+      `Stage: <b>${escapeHtml(full.stageLabel)}</b>\n` +
+      `Qty: <b>${full.qty}</b>\n` +
+      `Locked total: <b>${ethers.formatEther(BigInt(full.expectedTotalWei || "0"))}</b> ETH\n` +
+      `Fire at: <code>${escapeHtml(fireUtc)}</code>\n` +
+      `Timer: ~<b>${inMin}</b> min (5s early)\n\n` +
+      `Survives restarts.\n` +
+      `Type <code>disarm</code> to cancel all armed jobs.`,
+    { parse_mode: "HTML" },
+  );
+}
+
+async function listArmedStatus(ctx) {
+  try {
+    const rows = await dbListArmedMints();
+    const live = armedMints.map((j) => j.id);
+
+    if (!rows.length && !armedMints.length) {
+      return ctx.reply("🛰 No armed mints.");
+    }
+
+    let msg = `🛰 <b>Armed mints</b>\n\n`;
+
+    for (const row of rows) {
+      const fireUtc = new Date(row.fire_at)
+        .toISOString()
+        .replace("T", " ")
+        .replace(/\.\d+Z$/, " UTC");
+      const inMem = live.includes(row.id)
+        ? "timer ON"
+        : "timer OFF (will restore on restart)";
+      msg +=
+        `• <code>${escapeHtml(row.id)}</code>\n` +
+        `  ${escapeHtml(row.slug)} | ${escapeHtml(row.stage_label)} | qty ${row.qty}\n` +
+        `  ${escapeHtml(fireUtc)}\n` +
+        `  ${inMem}\n` +
+        `  Cancel: <code>cancelarm ${escapeHtml(row.id)}</code>\n\n`;
+    }
+
+    msg += `Cancel all: <code>disarm</code>`;
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  } catch (err) {
+    await ctx.reply(`❌ Armed list failed: ${err.message}`);
+  }
+}
+
+async function cancelArmedById(ctx, id) {
+  try {
+    const idx = armedMints.findIndex((j) => j.id === id);
+    if (idx >= 0) {
+      try {
+        clearTimeout(armedMints[idx].timer);
+      } catch {}
+      armedMints.splice(idx, 1);
+    }
+    await dbMarkArmedDone(id, "cancelled");
+    await ctx.reply(`🛰 Cancelled <code>${escapeHtml(id)}</code>`, {
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    await ctx.reply(`❌ Cancel failed: ${err.message}`);
+  }
+}
+
+async function restoreArmedMintsFromDb() {
+  try {
+    const rows = await dbListArmedMints();
+    let restored = 0;
+    for (const row of rows) {
+      const fireAt = new Date(row.fire_at).getTime();
+      const job = {
+        id: row.id,
+        chainKey: row.chain_key,
+        slug: row.slug,
+        contract: row.contract,
+        stageLabel: row.stage_label,
+        qty: row.qty,
+        expectedTotalWei: row.expected_total_wei || "0",
+        fireAt,
+      };
+
+      // if already past by a lot, still fire once (catch-up)
+      scheduleArmedTimer(job);
+      restored += 1;
+    }
+    console.log(`[armed] restored ${restored} job(s) from Supabase`);
+  } catch (err) {
+    console.error(`[armed] restore failed: ${err.message}`);
+  }
+}
+
+async function runInspectDrop(ctx, chainKey, contractAddress) {
+  try {
+    if (!ethers.isAddress(contractAddress)) {
+      return ctx.reply("❌ Invalid contract address.");
+    }
+
+    const { label, openseaSlug } = getChainRpcPool(chainKey);
+
+    await ctx.reply(
+      `📅 Inspecting drop on <b>${label}</b>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `Please wait...`,
+      { parse_mode: "HTML" },
+    );
+
+    let slug;
+    try {
+      slug = await resolveCollectionSlug(contractAddress, openseaSlug);
+    } catch (err) {
+      return ctx.reply(`❌ OpenSea lookup failed: ${err.message}`);
+    }
+    if (!slug)
+      return ctx.reply("❌ No OpenSea collection found for that contract.");
+
+    let drop;
+    try {
+      drop = await openseaFetch(`/drops/${encodeURIComponent(slug)}`);
+    } catch (err) {
+      return ctx.reply(
+        `❌ Not an OpenSea Drop (or stages unavailable).\n` +
+          `Slug: <code>${escapeHtml(slug)}</code>\n` +
+          `Error: ${escapeHtml(err.message)}`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    const stages = drop.stages || drop.mint_stages || [];
+    if (!Array.isArray(stages) || stages.length === 0) {
+      return ctx.reply(
+        `ℹ️ Drop found but no stages listed.\nSlug: <code>${escapeHtml(slug)}</code>`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    let msg =
+      `📅 <b>Drop inspect</b> (${label})\n` +
+      `Name: <b>${escapeHtml(drop.collection_name || drop.name || slug)}</b>\n` +
+      `Slug: <code>${escapeHtml(slug)}</code>\n` +
+      `Minting now: <b>${drop.is_minting ? "yes" : "no"}</b>\n` +
+      `Stages: <b>${stages.length}</b>\n\n`;
+
+    stages.forEach((s, i) => {
+      const labelS = s.label || s.stage_type || s.name || `Stage ${i + 1}`;
+      const start = s.start_time || s.startTime || s.starts_at;
+      const end = s.end_time || s.endTime || s.ends_at;
+      const price = formatStagePrice(s.price ?? s.mint_price);
+      const maxW =
+        s.max_total_mintable_by_wallet ||
+        s.maxPerWallet ||
+        s.max_per_wallet ||
+        s.max_mint_per_wallet ||
+        "?";
+      msg +=
+        `<b>${i + 1}. ${escapeHtml(String(labelS))}</b>\n` +
+        `Type: <code>${escapeHtml(String(s.stage_type || s.type || "?"))}</code>\n` +
+        `Start: <code>${escapeHtml(formatUtc(start))}</code>\n` +
+        `End: <code>${escapeHtml(formatUtc(end))}</code>\n` +
+        `Price: <b>${escapeHtml(price)}</b>\n` +
+        `Max/wallet: <b>${escapeHtml(String(maxW))}</b>\n\n`;
+    });
+
+    // Best-effort eligibility: which wallets can build a mint tx right now
+    const mintWallets = wallets || [];
+    if (mintWallets.length > 0) {
+      msg += `🔎 <b>Eligibility probe</b> (OpenSea mint build, qty=1)\n`;
+      let ok = 0;
+      for (const w of mintWallets) {
+        try {
+          await buildDropMintTransaction(slug, w.address, 1);
+          ok += 1;
+          msg += `✅ ${w.address.slice(0, 10)}...\n`;
+        } catch (err) {
+          const short = cleanOpenSeaError(err.message || "fail").slice(0, 50);
+          msg += `❌ ${w.address.slice(0, 10)}... ${escapeHtml(short)}\n`;
+        }
+      }
+      msg += `\nEligible now: <b>${ok}/${mintWallets.length}</b>\n`;
+      msg += `<i>Note: allowlist stages may show ineligible until that stage is live.</i>\n`;
+    }
+
+    msg += `\nReply with a <b>stage number</b> to arm (e.g. <code>1</code>), or <code>cancel</code>.`;
+
+    // Keep flow alive for stage selection
+    pendingSchedule = {
+      step: "stage",
+      chain: chainKey,
+      contract: contractAddress,
+      slug,
+      stages,
+      label,
+    };
+
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  } catch (err) {
+    pendingSchedule = null;
+    await ctx.reply(`❌ Inspect failed: ${err.message}`);
+  }
+}
+
+async function runListOffers(
+  ctx,
+  chainKey,
+  contractAddress,
+  minPrice,
+  maxPrice,
+) {
+  try {
+    if (!wallets || wallets.length === 0) {
+      return ctx.reply("❌ No minting wallets loaded.");
+    }
+    if (!ethers.isAddress(contractAddress)) {
+      return ctx.reply("❌ Invalid contract address.");
+    }
+
+    const { label, openseaSlug } = getChainRpcPool(chainKey);
+    const contractLower = contractAddress.toLowerCase();
+
+    await ctx.reply(
+      `🔎 Scanning offers on <b>${label}</b>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `Wallets: <b>${wallets.length}</b>\n` +
+        `Please wait...`,
+      { parse_mode: "HTML" },
+    );
+
+    let slug;
+    try {
+      slug = await resolveCollectionSlug(contractAddress, openseaSlug);
+    } catch (err) {
+      return ctx.reply(`❌ OpenSea collection lookup failed: ${err.message}`);
+    }
+    if (!slug)
+      return ctx.reply(
+        "❌ No OpenSea collection found for that contract on this chain.",
+      );
+
+    let ethUsd = null;
+    try {
+      ethUsd = await getEthPriceUsd();
+    } catch {
+      /* optional */
+    }
+
+    let ownedCount = 0;
+    let offerChecked = 0;
+    let offerFound = 0;
+    let filteredOut = 0;
+    const matches = [];
+    const debugOwned = [];
+
+    for (const w of wallets) {
+      let tokenIds = [];
+
+      // 1) OpenSea account NFTs
+      try {
+        let next = null;
+        let pages = 0;
+        do {
+          const path =
+            `/chain/${openseaSlug}/account/${w.address}/nfts?limit=50` +
+            (next ? `&next=${encodeURIComponent(next)}` : "");
+          const data = await openseaFetch(path);
+          const nfts = data.nfts || [];
+          for (const item of nfts) {
+            const c = String(
+              item.contract ||
+                item.contract_address ||
+                item.token_contract ||
+                item.collection?.contract ||
+                "",
+            ).toLowerCase();
+            if (c && c !== contractLower) continue;
+            // if contract field missing, still try when collection slug matches
+            const itemSlug = item.collection || item.collection_slug || "";
+            if (
+              !c &&
+              itemSlug &&
+              String(itemSlug).toLowerCase() !== String(slug).toLowerCase()
+            )
+              continue;
+            if (!c && !itemSlug) continue;
+
+            const id = item.identifier ?? item.token_id ?? item.tokenId;
+            if (id != null) tokenIds.push(String(id));
+          }
+          next = data.next || null;
+          pages += 1;
+        } while (next && pages < 6);
+      } catch (err) {
+        debugOwned.push(
+          `${w.address.slice(0, 10)}... NFT fetch err: ${(err.message || "").slice(0, 50)}`,
+        );
+      }
+
+      tokenIds = [...new Set(tokenIds)];
+      ownedCount += tokenIds.length;
+      if (tokenIds.length > 0) {
+        debugOwned.push(
+          `${w.address.slice(0, 10)}... owns ${tokenIds.length} token(s)`,
+        );
+      }
+
+      for (const tokenId of tokenIds.slice(0, 40)) {
+        offerChecked += 1;
+        let offer = null;
+
+        // 2) best offer
+        try {
+          const best = await openseaFetch(
+            `/offers/collection/${encodeURIComponent(slug)}/nfts/${encodeURIComponent(tokenId)}/best`,
+          );
+          offer = best?.offer || best;
+        } catch {
+          // try full offers list
+          try {
+            const all = await openseaFetch(
+              `/offers/collection/${encodeURIComponent(slug)}/nfts/${encodeURIComponent(tokenId)}?limit=5`,
+            );
+            const list = all?.offers || [];
+            offer = list[0] || null;
+          } catch {
+            offer = null;
+          }
+        }
+
+        if (
+          !offer ||
+          (offer.status && String(offer.status).toUpperCase() === "INACTIVE")
+        ) {
+          continue;
+        }
+        offerFound += 1;
+
+        const parsed = offerPriceToNativeAndUsd(offer);
+        if (!parsed) {
+          filteredOut += 1;
+          const rawPrice = JSON.stringify(
+            offer.price || offer.current_price || {},
+          ).slice(0, 120);
+          // string-only debug row (not acceptable)
+          matches.push({
+            line: `⚠️ ${w.address.slice(0, 10)}... #${tokenId} price parse failed: <code>${escapeHtml(rawPrice)}</code>`,
+            wallet: null,
+            tokenId: String(tokenId),
+            orderHash: null,
+          });
+          continue;
+        }
+
+        let usd = parsed.usd;
+        if (
+          usd == null &&
+          ethUsd &&
+          ["ETH", "WETH"].includes(parsed.currency)
+        ) {
+          usd = parsed.native * ethUsd;
+        }
+
+        let pass = true;
+        if (minPrice) {
+          if (minPrice.kind === "usd") {
+            if (usd == null || usd < minPrice.value) pass = false;
+          } else if (parsed.native < minPrice.value) pass = false;
+        }
+        if (pass && maxPrice) {
+          if (maxPrice.kind === "usd") {
+            if (usd == null || usd > maxPrice.value) pass = false;
+          } else if (parsed.native > maxPrice.value) pass = false;
+        }
+
+        if (!pass) {
+          filteredOut += 1;
+          continue;
+        }
+
+        const priceTxt =
+          usd != null
+            ? `${parsed.native.toFixed(5)} ${parsed.currency} (≈ $${usd.toFixed(2)})`
+            : `${parsed.native.toFixed(5)} ${parsed.currency}`;
+
+        const orderHash =
+          offer.order_hash || offer.orderHash || offer.hash || null;
+        const protocolAddress =
+          offer.protocol_address ||
+          offer.protocolAddress ||
+          "0x0000000000000068F116a894984e2DB1123eB395";
+
+        matches.push({
+          line: `✅ ${w.address.slice(0, 10)}... #${tokenId} → <b>${priceTxt}</b>`,
+          wallet: w,
+          tokenId: String(tokenId),
+          orderHash,
+          protocolAddress,
+          priceTxt,
+          slug,
+        });
+      }
+    }
+
+    const debug =
+      `Slug: <code>${escapeHtml(slug)}</code>\n` +
+      `Owned tokens found: <b>${ownedCount}</b>\n` +
+      `Offers checked: <b>${offerChecked}</b>\n` +
+      `Offers found: <b>${offerFound}</b>\n` +
+      `Filtered by price: <b>${filteredOut}</b>\n` +
+      (debugOwned.length ? `\n${debugOwned.slice(0, 12).join("\n")}` : "");
+
+    if (matches.length === 0) {
+      return ctx.reply(
+        `ℹ️ No matching offers.\n\n${debug}\n\n` +
+          `Tips:\n` +
+          `• Confirm wallets own this collection on OpenSea\n` +
+          `• Try min <code>$0</code> and max <code>none</code>`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    const lines = matches
+      .map((m) => m.line)
+      .slice(0, 40)
+      .join("\n");
+    const header =
+      `📋 <b>Offers</b> (${label})\n` +
+      `Collection: <code>${escapeHtml(slug)}</code>\n` +
+      `Matches: <b>${matches.length}</b>\n\n`;
+
+    await ctx.reply(header + lines, { parse_mode: "HTML" });
+    await ctx.reply(`🧾 Debug\n${debug}`, { parse_mode: "HTML" });
+
+    const acceptable = matches.filter((m) => m.wallet && m.orderHash);
+    if (acceptable.length === 0) {
+      return ctx.reply(
+        "No offers can be accepted automatically (missing order hash).",
+      );
+    }
+
+    pendingAcceptOffers = {
+      matches: acceptable,
+      chainKey,
+      contract: contractAddress,
+      slug,
+    };
+
+    await ctx.reply(
+      `💸 Accept <b>${acceptable.length}</b> offer(s)?\n\n` +
+        `Type <code>yes</code> to accept, or <code>no</code> to cancel.`,
+      { parse_mode: "HTML" },
+    );
+  } catch (err) {
+    await ctx.reply(`❌ Offers scan failed: ${err.message}`);
+  }
+}
 
 async function runCollectNfts(
   ctx,
@@ -781,6 +1805,8 @@ const mainMenu = Markup.keyboard([
   ["⏸ Pause ARC", "▶️ Resume ARC"],
   ["🎯 Sponsor ON", "🎯 Sponsor OFF"],
   ["⛽ Fund Gas", "📦 Collect NFTs"],
+  ["💸 Offers", "📅 Schedule Mint"],
+  ["🛰 Armed Mints"],
   ["⏸ Pause All", "▶️ Resume All"],
   ["ℹ️ Help"],
 ]).resize();
@@ -1019,6 +2045,41 @@ bot.hears("⛽ Fund Gas", async (ctx) => {
   );
 });
 
+bot.hears("🛰 Armed Mints", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  await listArmedStatus(ctx);
+});
+
+bot.hears("📅 Schedule Mint", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  pendingSchedule = { step: "chain" };
+  pendingFundGas = null;
+  pendingCollect = null;
+  pendingOffers = null;
+  pendingAcceptOffers = null;
+  await ctx.reply(
+    "📅 <b>Schedule Mint</b> (inspect)\n\n" +
+      "Step 1/2 — Chain:\n" +
+      "<code>rh</code> / <code>eth</code> / <code>ink</code> / <code>arc</code>\n\n" +
+      "Or <code>cancel</code>.",
+    { parse_mode: "HTML" },
+  );
+});
+
+bot.hears("💸 Offers", async (ctx) => {
+  if (!isAuthorizedChat(ctx)) return;
+  pendingOffers = { step: "chain" };
+  pendingFundGas = null;
+  pendingCollect = null;
+  await ctx.reply(
+    "💸 <b>List Offers</b>\n\n" +
+      "Step 1/4 — Chain:\n" +
+      "<code>rh</code> / <code>eth</code> / <code>ink</code> / <code>arc</code>\n\n" +
+      "Or <code>cancel</code>.",
+    { parse_mode: "HTML" },
+  );
+});
+
 bot.hears("📦 Collect NFTs", async (ctx) => {
   if (!isAuthorizedChat(ctx)) return;
 
@@ -1128,20 +2189,53 @@ bot.on("text", async (ctx, next) => {
     text.startsWith("💜") ||
     text.startsWith("🟧") ||
     text.startsWith("👛") ||
-    text.startsWith("ℹ️")
+    text.startsWith("ℹ️") ||
+    text.startsWith("💸") ||
+    text.startsWith("📅") ||
+    text.startsWith("🛰")
   ) {
     return next();
   }
 
   // If no interactive flow is active, do not block other handlers
-  if (!pendingFundGas && !pendingCollect) {
+  if (
+    !pendingFundGas &&
+    !pendingCollect &&
+    !pendingOffers &&
+    !pendingAcceptOffers &&
+    !pendingSchedule
+  ) {
     return next();
   }
 
   if (text.toLowerCase() === "cancel") {
     pendingFundGas = null;
     pendingCollect = null;
+    pendingOffers = null;
+    pendingAcceptOffers = null;
+    pendingSchedule = null;
     return ctx.reply("Cancelled.");
+  }
+
+  // Accept offers confirmation
+  if (pendingAcceptOffers) {
+    const ans = text.toLowerCase();
+    if (ans === "no" || ans === "n") {
+      pendingAcceptOffers = null;
+      return ctx.reply("Cancelled offer accept.");
+    }
+    if (ans === "yes" || ans === "y") {
+      const payload = pendingAcceptOffers;
+      pendingAcceptOffers = null;
+      await runAcceptOffers(ctx, payload);
+      return;
+    }
+    return ctx.reply(
+      "Type <code>yes</code> to accept or <code>no</code> to cancel.",
+      {
+        parse_mode: "HTML",
+      },
+    );
   }
 
   // Fund gas flow: chain → amount
@@ -1154,8 +2248,9 @@ bot.on("text", async (ctx, next) => {
       pendingFundGas = { step: "amount", chain: chainKey };
       const tokenName = chainKey === "arc" ? "USDC" : "ETH";
       return ctx.reply(
-        `⛽ Step 2/2 — Send amount of <b>${tokenName}</b> for <b>each</b> wallet.\n\n` +
-          `Example: <code>0.002</code>`,
+        `⛽ Step 2/2 — Amount for <b>each</b> wallet on <b>${chainKey}</b>.\n\n` +
+          `Native ${tokenName}: <code>0.002</code>\n` +
+          `Or dollars: <code>$3</code> / <code>3usd</code>`,
         { parse_mode: "HTML" },
       );
     }
@@ -1165,6 +2260,194 @@ bot.on("text", async (ctx, next) => {
       pendingFundGas = null;
       await runFundGas(ctx, text, chainKey);
       return;
+    }
+  }
+
+  // Schedule: chain → contract → stage → qty
+  if (pendingSchedule) {
+    if (pendingSchedule.step === "chain") {
+      const chainKey = parseChainKey(text);
+      if (!chainKey)
+        return ctx.reply("❌ Invalid chain. Use: rh / eth / ink / arc");
+      pendingSchedule = { step: "contract", chain: chainKey };
+      return ctx.reply(
+        "📅 Step 2 — Send the collection <b>contract address</b>.",
+        {
+          parse_mode: "HTML",
+        },
+      );
+    }
+
+    if (pendingSchedule.step === "contract") {
+      if (!ethers.isAddress(text))
+        return ctx.reply("❌ Invalid contract address.");
+      const chainKey = pendingSchedule.chain;
+      // runInspectDrop will set pendingSchedule.step = 'stage'
+      await runInspectDrop(ctx, chainKey, text);
+      return;
+    }
+
+    if (pendingSchedule.step === "stage") {
+      const n = Number(text.trim());
+      const stages = pendingSchedule.stages || [];
+      if (!Number.isInteger(n) || n < 1 || n > stages.length) {
+        return ctx.reply(`❌ Reply with a stage number 1–${stages.length}`);
+      }
+      const stage = stages[n - 1];
+      const startMs = parseStageStartMs(stage);
+      pendingSchedule = {
+        ...pendingSchedule,
+        step: "qty",
+        stageIndex: n - 1,
+        stage,
+        startMs,
+      };
+      return ctx.reply(
+        `📅 Stage <b>${n}</b> selected.\n` +
+          `Start: <code>${escapeHtml(formatUtc(stage.start_time || stage.startTime || stage.starts_at))}</code>\n\n` +
+          `Send mint <b>quantity</b> (e.g. <code>1</code>).`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    if (pendingSchedule.step === "qty") {
+      const qty = Number(text.trim());
+      if (!Number.isInteger(qty) || qty < 1 || qty > 100) {
+        return ctx.reply("❌ Quantity must be an integer 1–100");
+      }
+
+      const stage = pendingSchedule.stage;
+      const stageLabel =
+        stage.label ||
+        stage.stage_type ||
+        stage.name ||
+        `Stage ${pendingSchedule.stageIndex + 1}`;
+
+      // Read stage price (usually wei string per token)
+      let pricePerTokenWei = null;
+      const rawPrice =
+        stage.price ?? stage.mint_price ?? stage.price_wei ?? null;
+      try {
+        if (typeof rawPrice === "string" && /^\d+$/.test(rawPrice)) {
+          pricePerTokenWei = BigInt(rawPrice);
+        } else if (rawPrice && typeof rawPrice === "object") {
+          const v = rawPrice.value ?? rawPrice.amount ?? rawPrice.unit;
+          if (v != null && /^\d+$/.test(String(v)))
+            pricePerTokenWei = BigInt(String(v));
+        }
+      } catch {
+        pricePerTokenWei = null;
+      }
+
+      if (pricePerTokenWei == null) {
+        pendingSchedule = null;
+        return ctx.reply(
+          "❌ Could not read this stage’s price. Arm cancelled.\n" +
+            "Pick another stage or inspect the drop again.",
+        );
+      }
+
+      const expectedTotalWei = (pricePerTokenWei * BigInt(qty)).toString();
+
+      let fireAt = pendingSchedule.startMs;
+      if (!fireAt) fireAt = Date.now() + 3000;
+
+      const job = {
+        chainKey: pendingSchedule.chain,
+        slug: pendingSchedule.slug,
+        contract: pendingSchedule.contract,
+        stageLabel: String(stageLabel),
+        qty,
+        fireAt,
+        expectedTotalWei,
+      };
+
+      pendingSchedule = null;
+      await armMintJob(ctx, job);
+      return;
+    }
+  }
+
+  // cancel one armed job: cancelarm arm-...
+  if (text.toLowerCase().startsWith("cancelarm ")) {
+    const id = text.slice("cancelarm ".length).trim();
+    if (!id) return ctx.reply("Usage: cancelarm <id>");
+    await cancelArmedById(ctx, id);
+    return;
+  }
+
+  if (text.toLowerCase() === "disarm") {
+    for (const j of armedMints) {
+      try {
+        clearTimeout(j.timer);
+      } catch {}
+      try {
+        await dbMarkArmedDone(j.id, "cancelled");
+      } catch {}
+    }
+    const n = armedMints.length;
+    armedMints = [];
+    return ctx.reply(`🛰 Disarmed <b>${n}</b> job(s).`, { parse_mode: "HTML" });
+  }
+
+  // Offers flow: chain → contract → min → max
+  if (pendingOffers) {
+    if (pendingOffers.step === "chain") {
+      const chainKey = parseChainKey(text);
+      if (!chainKey)
+        return ctx.reply("❌ Invalid chain. Use: rh / eth / ink / arc");
+      pendingOffers = { step: "contract", chain: chainKey };
+      return ctx.reply(
+        "💸 Step 2/4 — Send the collection <b>contract address</b>.",
+        { parse_mode: "HTML" },
+      );
+    }
+
+    if (pendingOffers.step === "contract") {
+      if (!ethers.isAddress(text))
+        return ctx.reply("❌ Invalid contract address.");
+      pendingOffers = {
+        step: "min",
+        chain: pendingOffers.chain,
+        contract: text,
+      };
+      return ctx.reply(
+        "💸 Step 3/4 — Min price.\nExamples: <code>$20</code> or <code>0.01</code>",
+        { parse_mode: "HTML" },
+      );
+    }
+
+    if (pendingOffers.step === "min") {
+      try {
+        const minPrice = parsePriceInput(text);
+        if (!minPrice) return ctx.reply("❌ Min price required.");
+        pendingOffers = {
+          step: "max",
+          chain: pendingOffers.chain,
+          contract: pendingOffers.contract,
+          min: minPrice,
+        };
+        return ctx.reply(
+          "💸 Step 4/4 — Max price.\nExamples: <code>$100</code> / <code>0.05</code> / <code>none</code>",
+          { parse_mode: "HTML" },
+        );
+      } catch {
+        return ctx.reply("❌ Invalid min price.");
+      }
+    }
+
+    if (pendingOffers.step === "max") {
+      try {
+        const maxPrice = parsePriceInput(text);
+        const { chain, contract, min } = pendingOffers;
+        pendingOffers = null;
+        await runListOffers(ctx, chain, contract, min, maxPrice);
+        return;
+      } catch {
+        return ctx.reply(
+          "❌ Invalid max price. Use a number, $amount, or none.",
+        );
+      }
     }
   }
 
@@ -1363,9 +2646,12 @@ bot.command("fundgas", async (ctx) => {
   if (!amountStr) {
     pendingFundGas = { step: "chain" };
     return ctx.reply(
-      "Usage: <code>/fundgas 0.002 arc</code>\n" +
+      "Usage:\n" +
+        "<code>/fundgas 0.002 rh</code>\n" +
+        "<code>/fundgas $3 eth</code>\n" +
+        "<code>/fundgas 5usd arc</code>\n\n" +
         "Chains: <code>rh</code> / <code>eth</code> / <code>ink</code> / <code>arc</code>\n" +
-        "Note: on Arc amount is native USDC",
+        "On Arc, $ amounts are treated as USDC (~$1 each)",
       { parse_mode: "HTML" },
     );
   }
@@ -2437,6 +3723,8 @@ async function main() {
   console.log(`[startup] loaded ${watchedWallets.length} watched wallet(s)`);
   console.log("[startup] loading daily stats from Supabase...");
   await loadDailyStats();
+  console.log("[startup] restoring armed mints from Supabase...");
+  await restoreArmedMintsFromDb();
   setInterval(refreshWatchedWallets, WALLET_REFRESH_MS);
 
   console.log("[startup] launching Telegram bot (long-poll)...");
