@@ -524,13 +524,37 @@ function isAuthorizedChat(ctx) {
 }
 
 async function notify(text) {
+  // Telegram rejects messages over 4096 chars. Cut on a line boundary so we
+  // never silently lose the whole message (e.g. a long failure report).
+  const MAX = 4000;
+  let body = String(text);
+  if (body.length > MAX) {
+    const cut = body.lastIndexOf("\n", MAX - 40);
+    body = body.slice(0, cut > 0 ? cut : MAX - 40) + "\n…(truncated)";
+  }
   try {
-    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, text, {
+    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, body, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
     });
   } catch (err) {
     console.error(`[telegram] failed to send message: ${err.message}`);
+    // Bad/unbalanced HTML (e.g. a stray "<" in an error string) makes
+    // Telegram reject the message. Resend as plain text so it still arrives.
+    if (/parse entities|can't parse/i.test(err.message || "")) {
+      try {
+        const plain = body
+          .replace(/<[^>]+>/g, "")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&amp;/g, "&");
+        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, plain, {
+          disable_web_page_preview: true,
+        });
+      } catch (err2) {
+        console.error(`[telegram] plain-text resend failed: ${err2.message}`);
+      }
+    }
   }
 }
 
@@ -2903,30 +2927,153 @@ async function buildDropMintTransaction(slug, minter, quantity) {
 }
 
 // ---------------------------------------------------------------------------
-// Fallback: direct on-chain mint when there's no OpenSea Drop
+// Fallback: direct on-chain mint when OpenSea can't build the mint tx
 // ---------------------------------------------------------------------------
+//
+// Strategy, most reliable first. For every wallet we build a list of
+// candidate transactions and try them in order:
+//
+//   1. REPLAY  — fetch the watched wallet's own mint tx from the chain and
+//      re-send the same calldata + the same ETH value from OUR wallet (the
+//      watched wallet's address, if it appears in the calldata, is swapped
+//      for ours). This uses the exact function and the exact price the
+//      collection actually accepted, so it works for custom mint functions
+//      that no hard-coded signature list could ever cover.
+//   2. ABI GUESS — every mint/claim/purchase-style function in the verified
+//      ABI (proxy implementations included), with arguments filled in by
+//      type, plus a short list of common signatures as a last resort.
+//
+// Every candidate is SIMULATED with estimateGas first. A candidate that
+// would revert is skipped without spending gas; only one that simulates
+// cleanly is broadcast.
+
+const DIRECT_MINT_NAME_RE = /(mint|claim|purchase|buy|sale)/i;
+// admin / setter style functions that match the regex above but are never
+// a public mint
+const DIRECT_MINT_EXCLUDE_RE =
+  /^(set|update|withdraw|toggle|pause|unpause|burn|transfer|approve|is|get|has|can|remove|add)|owner|admin|team|airdrop|reserve|dev/i;
+const DIRECT_QTY_PARAM_RE = /(qty|quantity|amount|count|num)/i;
+const DIRECT_MAX_CANDIDATES = Number(
+  process.env.DIRECT_MINT_MAX_CANDIDATES || 40,
+);
+
+const DIRECT_MINT_ABI_FALLBACK = [
+  "function mint() public payable",
+  "function mint(uint256 quantity) public payable",
+  "function mint(address to) public payable",
+  "function mint(address to, uint256 quantity) public payable",
+  "function publicMint() public payable",
+  "function publicMint(uint256 quantity) public payable",
+  "function claim() public payable",
+  "function claim(uint256 quantity) public payable",
+  "function claim(address to, uint256 quantity) public payable",
+  "function safeMint(address to) public payable",
+  "function safeMint(address to, uint256 quantity) public payable",
+  "function mintNFT(uint256 quantity) public payable",
+  "function mintPublic(uint256 quantity) public payable",
+];
+
+// Zero-arg view functions that commonly expose the per-token mint price.
+const PRICE_GETTER_NAMES = [
+  "mintPrice",
+  "price",
+  "cost",
+  "publicPrice",
+  "publicMintPrice",
+  "salePrice",
+  "tokenPrice",
+  "mintCost",
+  "getMintPrice",
+  "PRICE",
+  "MINT_PRICE",
+];
+const PRICE_GETTER_ABI = PRICE_GETTER_NAMES.map(
+  (n) => `function ${n}() view returns (uint256)`,
+);
+
+function mergeAbis(...abis) {
+  const seen = new Set();
+  const out = [];
+  for (const abi of abis) {
+    for (const item of abi || []) {
+      const key = `${item.type}:${item.name || ""}:${(item.inputs || [])
+        .map((i) => i.type)
+        .join(",")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+  }
+  return out;
+}
 
 async function fetchAbiFromExplorer(
   contractAddress,
   explorerBase,
   explorerKey = "",
+  chainId = null,
 ) {
   if (!explorerBase) {
     console.warn("[explorer] No explorer API base configured");
     return null;
   }
 
-  // Note: This path works for Blockscout-style explorers (Robinhood + Ink).
-  // Etherscan uses a different format, so Ethereum fallback may still fail for now.
-  const url = `${explorerBase}/smart-contracts/${contractAddress}${
-    explorerKey ? `?apikey=${explorerKey}` : ""
-  }`;
+  const keyQs = (prefix) =>
+    explorerKey ? `${prefix}apikey=${encodeURIComponent(explorerKey)}` : "";
 
   try {
-    const res = await fetchWithTimeout(url, {}, 10000);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.abi || null;
+    // Etherscan-style (Ethereum). For the multichain v2 API set
+    // ETH_EXPLORER_API_BASE=https://api.etherscan.io/v2/api
+    if (/etherscan/i.test(explorerBase)) {
+      const url =
+        `${explorerBase}?module=contract&action=getabi&address=${contractAddress}` +
+        (chainId ? `&chainid=${chainId}` : "") +
+        keyQs("&");
+      const res = await fetchWithTimeout(url, {}, 10000);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.status !== "1" || typeof data.result !== "string") {
+        console.warn(
+          `[explorer] etherscan getabi: ${String(data.result || data.message).slice(0, 100)}`,
+        );
+        return null;
+      }
+      return JSON.parse(data.result);
+    }
+
+    // Blockscout-style (Robinhood, Ink, ...)
+    const getBlockscout = async (addr) => {
+      const res = await fetchWithTimeout(
+        `${explorerBase}/smart-contracts/${addr}${keyQs("?")}`,
+        {},
+        10000,
+      );
+      if (!res.ok) return null;
+      return res.json();
+    };
+
+    const data = await getBlockscout(contractAddress);
+    if (!data) return null;
+
+    const abis = [Array.isArray(data.abi) ? data.abi : []];
+
+    // Proxy contracts: the mint function lives on the implementation, so
+    // pull that ABI too instead of only seeing the proxy's.
+    const implAddrs = [
+      ...(data.implementations || []).map((i) => i.address_hash || i.address),
+      data.implementation_address,
+    ].filter((a) => a && ethers.isAddress(a));
+    for (const addr of [...new Set(implAddrs)].slice(0, 2)) {
+      try {
+        const impl = await getBlockscout(addr);
+        if (Array.isArray(impl?.abi)) abis.push(impl.abi);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const merged = mergeAbis(...abis);
+    return merged.length ? merged : null;
   } catch (err) {
     console.warn(
       `[explorer] ABI fetch failed for ${contractAddress}: ${err.message}`,
@@ -2942,11 +3089,217 @@ function abiHasFunction(abi, name) {
   );
 }
 
+function shortEthersReason(err) {
+  return String(err?.reason || err?.shortMessage || err?.message || err)
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+}
+
+// Candidate 1: replay the watched wallet's own mint tx from our wallet.
+function buildReplayCandidate(srcTx, sourceWallet, targetAddress) {
+  if (!srcTx || !srcTx.to || !srcTx.data || srcTx.data === "0x") return null;
+
+  let data = srcTx.data.toLowerCase();
+  const ours = targetAddress.toLowerCase().replace(/^0x/, "");
+  const theirs = new Set(
+    [sourceWallet, srcTx.from]
+      .filter(Boolean)
+      .map((a) => a.toLowerCase().replace(/^0x/, "")),
+  );
+  for (const addr of theirs) {
+    if (addr === ours) continue;
+    data = data.split(addr).join(ours);
+  }
+  return {
+    label: "replay of source tx",
+    to: srcTx.to,
+    data,
+    value: BigInt(srcTx.value ?? 0n),
+  };
+}
+
+// Pick a value for one ABI parameter, or say we can't.
+function directArgForParam(param, walletAddress, qty, uintCount) {
+  const t = param.type;
+  if (t === "address") return { ok: true, v: walletAddress };
+  if (/^uint\d*$/.test(t)) {
+    // Only treat a uint as "quantity" when it's the only one or is named
+    // like one — never guess a tokenId / stage id and mint the wrong thing.
+    if (uintCount === 1 || DIRECT_QTY_PARAM_RE.test(param.name || "")) {
+      return { ok: true, v: BigInt(qty) };
+    }
+    return { ok: false };
+  }
+  if (t === "bool") return { ok: true, v: false };
+  if (t === "string") return { ok: true, v: "" };
+  if (t === "bytes") return { ok: true, v: "0x" };
+  if (/^bytes\d+$/.test(t)) {
+    return { ok: true, v: "0x" + "00".repeat(Number(t.slice(5))) };
+  }
+  if (t.endsWith("[]")) return { ok: true, v: [] }; // e.g. empty merkle proof
+  return { ok: false };
+}
+
+// Candidate 2: mint-style functions from an ABI, arguments filled by type.
+function buildAbiCandidates(
+  abi,
+  contractAddress,
+  walletAddress,
+  qtys,
+  valueForQty,
+) {
+  let iface;
+  try {
+    iface = new ethers.Interface(abi);
+  } catch (err) {
+    console.warn(`[direct-mint] could not parse ABI: ${err.message}`);
+    return [];
+  }
+
+  const rank = (f) =>
+    /^(public)?mint$/i.test(f.name) ? 0 : /^(mint|claim)/i.test(f.name) ? 1 : 2;
+
+  const fns = iface.fragments
+    .filter(
+      (f) =>
+        f.type === "function" &&
+        DIRECT_MINT_NAME_RE.test(f.name) &&
+        !DIRECT_MINT_EXCLUDE_RE.test(f.name) &&
+        (f.stateMutability === "payable" || f.stateMutability === "nonpayable"),
+    )
+    .sort((a, b) => rank(a) - rank(b) || a.inputs.length - b.inputs.length);
+
+  const out = [];
+  const seen = new Set();
+
+  for (const frag of fns) {
+    const uintCount = frag.inputs.filter((i) =>
+      /^uint\d*$/.test(i.type),
+    ).length;
+    for (const qty of qtys) {
+      const args = [];
+      let ok = true;
+      for (const p of frag.inputs) {
+        const r = directArgForParam(p, walletAddress, qty, uintCount);
+        if (!r.ok) {
+          ok = false;
+          break;
+        }
+        args.push(r.v);
+      }
+      if (!ok) continue;
+
+      let data;
+      try {
+        data = iface.encodeFunctionData(frag, args);
+      } catch {
+        continue;
+      }
+      const value = frag.payable ? valueForQty(qty) : 0n;
+      const key = `${data}:${value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        label: `${frag.format("sighash")} qty=${qty}`,
+        to: contractAddress,
+        data,
+        value,
+      });
+    }
+  }
+  return out;
+}
+
+// Per-token price: from the watched wallet's tx if it paid something,
+// otherwise from common on-chain price getters, otherwise free (0).
+async function discoverUnitPriceWei(contractAddress, provider, srcTx, srcQty) {
+  if (srcTx && BigInt(srcTx.value ?? 0n) > 0n) {
+    return BigInt(srcTx.value) / BigInt(Math.max(srcQty, 1));
+  }
+  const c = new ethers.Contract(contractAddress, PRICE_GETTER_ABI, provider);
+  const settled = await Promise.allSettled(
+    PRICE_GETTER_NAMES.map((n) => c[n]()),
+  );
+  for (const s of settled) {
+    if (
+      s.status === "fulfilled" &&
+      typeof s.value === "bigint" &&
+      s.value > 0n
+    ) {
+      return s.value;
+    }
+  }
+  return 0n;
+}
+
+// Simulate, balance-check, then broadcast one candidate.
+async function trySendDirectCandidate(cand, payer, provider, maxPriceEth) {
+  const valueEth = Number(ethers.formatEther(cand.value));
+  if (
+    maxPriceEth !== null &&
+    maxPriceEth !== undefined &&
+    valueEth > maxPriceEth
+  ) {
+    return {
+      ok: false,
+      reason: `price ${valueEth} ETH above limit ${maxPriceEth}`,
+    };
+  }
+
+  let gasLimit;
+  try {
+    const est = await provider.estimateGas({
+      from: payer.address,
+      to: cand.to,
+      data: cand.data,
+      value: cand.value,
+    });
+    gasLimit = (est * 120n) / 100n;
+  } catch (err) {
+    return { ok: false, reason: `would revert: ${shortEthersReason(err)}` };
+  }
+
+  try {
+    const [balance, feeData] = await Promise.all([
+      provider.getBalance(payer.address),
+      provider.getFeeData(),
+    ]);
+    const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
+    const need = cand.value + gasLimit * gasPrice;
+    if (balance < need) {
+      return {
+        ok: false,
+        reason: `insufficient balance (need ~${ethers.formatEther(need)} ETH)`,
+      };
+    }
+
+    const tx = await payer.signer.connect(provider).sendTransaction({
+      to: cand.to,
+      data: cand.data,
+      value: cand.value,
+      gasLimit,
+    });
+    const receipt = await tx.wait();
+    if (receipt && receipt.status === 1) return { ok: true, hash: tx.hash };
+    return { ok: false, reason: "reverted on-chain", stop: true };
+  } catch (err) {
+    // err.receipt is set when the tx was mined but reverted — stop spending
+    // gas on further variants for this wallet in that case.
+    return {
+      ok: false,
+      reason: `send failed: ${shortEthersReason(err)}`,
+      stop: Boolean(err?.receipt),
+    };
+  }
+}
+
 async function attemptDirectMint(
   contractAddress,
   sourceWallet,
   chainName = "robinhood",
+  opts = {},
 ) {
+  const { sourceTxHash = null, detectedQty = 1, targetWallets = null } = opts;
   const chain = chainConfigs[chainName] || chainConfigs.robinhood;
 
   const activeRpcPool =
@@ -2958,10 +3311,9 @@ async function attemptDirectMint(
           ? arcRpcPool
           : rpcPool;
 
-  const activeDryRun = chain.dryRun;
-  const explorerBase = chain.explorerApiBase;
-  const explorerKey = chain.explorerApiKey || "";
-  if (activeDryRun) {
+  const contractKey = contractAddress.toLowerCase();
+
+  if (chain.dryRun) {
     await notify(
       `⚙️ <b>Direct mint fallback</b>\n` +
         `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
@@ -2974,110 +3326,164 @@ async function attemptDirectMint(
     await notify(`❌ No minting wallet available for direct mint`);
     return;
   }
-
   if (!activeRpcPool) {
     await notify(`❌ No RPC pool ready for ${chainName}`);
     return;
   }
+
   const provider = activeRpcPool.current();
-  const mintWallets =
-    wallets.length > 0
-      ? wallets
-      : [{ address: WALLET_ADDRESS, signer: signer }];
 
-  const EXTRA_MINT_ABIS = [
-    "function mint() public payable",
-    "function mint(uint256 quantity) public payable",
-    "function mint(address to) public payable",
-    "function mint(address to, uint256 quantity) public payable",
-    "function publicMint() public payable",
-    "function publicMint(uint256 quantity) public payable",
-    "function claim() public payable",
-    "function claim(uint256 quantity) public payable",
-    "function claim(address to, uint256 quantity) public payable",
-    "function safeMint(address to) public payable",
-    "function safeMint(address to, uint256 quantity) public payable",
-    "function mintNFT(uint256 quantity) public payable",
-    "function mintPublic(uint256 quantity) public payable",
-  ];
+  // Only the wallets OpenSea failed for (or all, if none were specified),
+  // and never a wallet that already minted this collection.
+  let mintWallets =
+    targetWallets && targetWallets.length > 0
+      ? targetWallets
+      : wallets.length > 0
+        ? wallets
+        : [{ address: WALLET_ADDRESS, signer }];
+  mintWallets = mintWallets.filter(
+    (w) => !successfulMints.has(`${contractKey}:${w.address.toLowerCase()}`),
+  );
+  if (mintWallets.length === 0) {
+    await notify(
+      `⏭ <b>Direct mint skipped</b>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `All wallets already minted this collection.`,
+    );
+    return;
+  }
 
+  // 1) The watched wallet's own mint tx (best source of truth)
+  let srcTx = null;
+  if (sourceTxHash) {
+    try {
+      srcTx = await activeRpcPool.withFailover((p) =>
+        p.getTransaction(sourceTxHash),
+      );
+    } catch (err) {
+      console.warn(`[direct-mint] could not fetch source tx: ${err.message}`);
+    }
+  }
+
+  // 2) Verified ABI (proxy implementations included)
   const remoteAbi = await fetchAbiFromExplorer(
     contractAddress,
-    explorerBase,
-    explorerKey,
+    chain.explorerApiBase,
+    chain.explorerApiKey || "",
+    chain.chainId,
   );
-  const quantitiesToTry = [1, 2, 3, 5];
+
+  // 3) Price. MINT_VALUE_ETH, if set, is a fixed value sent with every call.
+  const overrideWei = process.env.MINT_VALUE_ETH
+    ? ethers.parseEther(process.env.MINT_VALUE_ETH)
+    : null;
+  let unitPriceWei = 0n;
+  if (overrideWei === null) {
+    try {
+      unitPriceWei = await discoverUnitPriceWei(
+        contractAddress,
+        provider,
+        srcTx,
+        detectedQty,
+      );
+    } catch (err) {
+      console.warn(`[direct-mint] price discovery failed: ${err.message}`);
+    }
+  }
+  const valueForQty = (qty) =>
+    overrideWei !== null ? overrideWei : unitPriceWei * BigInt(qty);
+
+  const qtys = [
+    ...new Set(
+      [detectedQty, 1, 2, 3, 5].filter((n) => Number.isInteger(n) && n > 0),
+    ),
+  ];
+  const useSponsor = isSponsorMode && sponsorWallet;
+
   const results = [];
-  let anySuccess = false;
+  let successCount = 0;
 
   for (const wallet of mintWallets) {
-    const connectedSigner = wallet.signer.connect(provider);
-    const candidates = [];
-
+    const cands = [];
+    const replay = buildReplayCandidate(srcTx, sourceWallet, wallet.address);
+    if (replay) cands.push(replay);
     if (remoteAbi) {
-      candidates.push(
-        new ethers.Contract(contractAddress, remoteAbi, connectedSigner),
+      cands.push(
+        ...buildAbiCandidates(
+          remoteAbi,
+          contractAddress,
+          wallet.address,
+          qtys,
+          valueForQty,
+        ),
       );
     }
-    candidates.push(
-      new ethers.Contract(contractAddress, EXTRA_MINT_ABIS, connectedSigner),
+    cands.push(
+      ...buildAbiCandidates(
+        DIRECT_MINT_ABI_FALLBACK,
+        contractAddress,
+        wallet.address,
+        qtys,
+        valueForQty,
+      ),
     );
 
-    const overrideValue = process.env.MINT_VALUE_ETH
-      ? ethers.parseEther(process.env.MINT_VALUE_ETH)
-      : 0n;
+    // de-dupe, cap
+    const seen = new Set();
+    const unique = cands
+      .filter((c) => {
+        const k = `${c.to.toLowerCase()}:${c.data}:${c.value}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .slice(0, DIRECT_MAX_CANDIDATES);
 
-    let walletSuccess = false;
+    const reasons = new Map();
+    let done = false;
 
-    for (const contract of candidates) {
-      const attempts = [];
-      for (const qty of quantitiesToTry) {
-        attempts.push(() => contract.mint({ value: overrideValue }));
-        attempts.push(() => contract.mint(qty, { value: overrideValue }));
-        attempts.push(() =>
-          contract.mint(wallet.address, { value: overrideValue }),
+    for (const cand of unique) {
+      // Sponsor can only pay if the calldata names our wallet as recipient;
+      // otherwise the NFT would land in the sponsor wallet.
+      const sponsorOk =
+        useSponsor &&
+        cand.data.toLowerCase().includes(wallet.address.toLowerCase().slice(2));
+      const payer = sponsorOk ? sponsorWallet : wallet;
+
+      const r = await trySendDirectCandidate(
+        cand,
+        payer,
+        provider,
+        chain.maxPriceEth,
+      );
+
+      if (r.ok) {
+        successCount += 1;
+        done = true;
+        successfulMints.add(`${contractKey}:${wallet.address.toLowerCase()}`);
+        dailyStats.success += 1;
+        await saveDailyStats();
+        results.push(
+          `✅ ${wallet.address.slice(0, 10)}... ${cand.label}` +
+            (sponsorOk ? ` (paid by sponsor)` : "") +
+            ` | Tx: ${r.hash.slice(0, 12)}...`,
         );
-        attempts.push(() =>
-          contract.mint(wallet.address, qty, { value: overrideValue }),
-        );
-        attempts.push(() => contract.publicMint({ value: overrideValue }));
-        attempts.push(() => contract.publicMint(qty, { value: overrideValue }));
-        attempts.push(() => contract.claim({ value: overrideValue }));
-        attempts.push(() => contract.claim(qty, { value: overrideValue }));
-        attempts.push(() =>
-          contract.claim(wallet.address, qty, { value: overrideValue }),
-        );
-        attempts.push(() =>
-          contract.safeMint(wallet.address, { value: overrideValue }),
-        );
-        attempts.push(() =>
-          contract.safeMint(wallet.address, qty, { value: overrideValue }),
-        );
-        attempts.push(() => contract.mintNFT(qty, { value: overrideValue }));
-        attempts.push(() => contract.mintPublic(qty, { value: overrideValue }));
+        break;
       }
 
-      for (const attempt of attempts) {
-        try {
-          const tx = await attempt();
-          const receipt = await tx.wait();
-          if (receipt.status === 1) {
-            results.push(
-              `✅ ${wallet.address.slice(0, 10)}... tx ${tx.hash.slice(0, 12)}...`,
-            );
-            walletSuccess = true;
-            anySuccess = true;
-            break;
-          }
-        } catch (err) {
-          continue;
-        }
-      }
-      if (walletSuccess) break;
+      reasons.set(r.reason, (reasons.get(r.reason) || 0) + 1);
+      if (r.stop) break;
     }
 
-    if (!walletSuccess) {
-      results.push(`❌ ${wallet.address.slice(0, 10)}... failed`);
+    if (!done) {
+      const top = [...reasons.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([why, n]) => `${why} (x${n})`)
+        .join(" | ");
+      results.push(
+        `❌ ${wallet.address.slice(0, 10)}... ${unique.length} variant(s) tried → ${top || "no usable mint function found"}`,
+      );
     }
   }
 
@@ -3085,11 +3491,13 @@ async function attemptDirectMint(
     `⚙️ <b>Direct mint fallback</b>\n` +
     `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
     `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-    `Success: <b>${anySuccess ? "yes" : "no"}</b>\n\n` +
-    results.join("\n");
+    `Source tx: <b>${srcTx ? "found (replay enabled)" : "not found"}</b> | ` +
+    `ABI: <b>${remoteAbi ? "verified" : "unverified"}</b>\n` +
+    `Success: <b>${successCount}/${mintWallets.length}</b>\n\n` +
+    results.map(escapeHtml).join("\n");
 
-  if (!anySuccess) {
-    msg += `\n\n⚠️ Likely allowlist/signature or custom mint method.`;
+  if (successCount === 0) {
+    msg += `\n\n⚠️ Likely allowlist/signature-gated, sold out, or not live yet.`;
   }
 
   await notify(msg);
@@ -3205,40 +3613,6 @@ async function copyMint(
   if (!quantityTries.includes(detectedQty)) quantityTries.push(detectedQty);
   quantityTries = [...new Set(quantityTries)].sort((a, b) => b - a);
 
-  // Resolve collection
-  let slug = null;
-  try {
-    slug = await resolveCollectionSlug(contractAddress, activeOpenseaSlug);
-  } catch (err) {
-    await notify(
-      `🔔 <b>${chainLabel} Mint detected</b>\n` +
-        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-        `⚠️ OpenSea lookup failed → trying direct mint`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet, chainName);
-  }
-
-  if (!slug) {
-    await notify(
-      `🔔 <b>${chainLabel} Mint detected</b>\n` +
-        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-        `⚠️ No OpenSea Drop found → trying direct mint`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet, chainName);
-  }
-
-  // Initial summary message
-  await notify(
-    `🔔 <b>${chainLabel} Mint detected</b>\n` +
-      `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-      `Collection: <code>${escapeHtml(slug)}</code>\n` +
-      `Detected qty: <b>${detectedQty}</b>\n` +
-      `Trying quantities: <b>${quantityTries.join(", ")}</b>\n` +
-      `Wallets: <b>${wallets.length || 1}</b>`,
-  );
-
   let targetWallets = activeDryRun
     ? [{ address: wallets[0]?.address || WALLET_ADDRESS || ethers.ZeroAddress }]
     : wallets;
@@ -3283,6 +3657,53 @@ async function copyMint(
     );
   }
 
+  // Everything the direct-mint fallback needs to replay the source mint
+  const directOpts = { sourceTxHash, detectedQty, targetWallets };
+
+  // Resolve collection
+  let slug = null;
+  try {
+    slug = await resolveCollectionSlug(contractAddress, activeOpenseaSlug);
+  } catch (err) {
+    await notify(
+      `🔔 <b>${chainLabel} Mint detected</b>\n` +
+        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `⚠️ OpenSea lookup failed → trying direct mint`,
+    );
+    return attemptDirectMint(
+      contractAddress,
+      sourceWallet,
+      chainName,
+      directOpts,
+    );
+  }
+
+  if (!slug) {
+    await notify(
+      `🔔 <b>${chainLabel} Mint detected</b>\n` +
+        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `⚠️ No OpenSea Drop found → trying direct mint`,
+    );
+    return attemptDirectMint(
+      contractAddress,
+      sourceWallet,
+      chainName,
+      directOpts,
+    );
+  }
+
+  // Initial summary message
+  await notify(
+    `🔔 <b>${chainLabel} Mint detected</b>\n` +
+      `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+      `Collection: <code>${escapeHtml(slug)}</code>\n` +
+      `Detected qty: <b>${detectedQty}</b>\n` +
+      `Trying quantities: <b>${quantityTries.join(", ")}</b>\n` +
+      `Wallets: <b>${wallets.length || 1}</b>`,
+  );
+
   dailyStats.attempted += 1;
   await saveDailyStats();
   let successCount = 0;
@@ -3308,7 +3729,13 @@ async function copyMint(
         continue;
       }
 
-      const valueWei = BigInt(value || "0");
+      let valueWei;
+      try {
+        valueWei = BigInt(value || "0");
+      } catch {
+        lastError = `Bad value from OpenSea: ${String(value).slice(0, 40)}`;
+        continue;
+      }
       const valueEth = Number(ethers.formatEther(valueWei));
 
       if (activeMaxPrice !== null && valueEth > activeMaxPrice) {
@@ -3382,11 +3809,25 @@ async function copyMint(
         `❌ ${targetWallet.address.slice(0, 10)}... failed → ${lastError.slice(0, 80)}`,
       );
     }
+    return walletSuccess;
   };
 
-  // Sequential: one wallet at a time (more consistent, less race)
+  // Sequential: one wallet at a time (more consistent, less race).
+  // Track which wallets OpenSea failed for so ONLY those fall back to a
+  // direct mint — and an unexpected exception counts as a failure instead of
+  // escaping copyMint (which used to skip the fallback entirely).
+  const failedWallets = [];
   for (const targetWallet of targetWallets) {
-    await mintOne(targetWallet);
+    let ok = false;
+    try {
+      ok = await mintOne(targetWallet);
+    } catch (err) {
+      console.error("[mintOne] unexpected error:", err);
+      results.push(
+        `❌ ${targetWallet.address.slice(0, 10)}... crashed → ${cleanOpenSeaError(err.message || "error").slice(0, 80)}`,
+      );
+    }
+    if (!ok) failedWallets.push(targetWallet);
   }
 
   // Final summary message
@@ -3394,14 +3835,21 @@ async function copyMint(
     `📋 <b>Result for</b> <code>${escapeHtml(slug)}</code>\n` +
     `Success: <b>${successCount}/${targetWallets.length}</b> wallets\n\n`;
 
-  summary += results.join("\n");
+  summary += results.map(escapeHtml).join("\n");
 
   if (successCount === 0) {
     dailyStats.failed += 1;
     await saveDailyStats();
-    summary += `\n\n⚠️ All OpenSea attempts failed. Trying direct mint fallback...`;
+  }
+
+  // Fall back for every wallet OpenSea failed for — not only when ALL failed.
+  if (failedWallets.length > 0) {
+    summary += `\n\n⚠️ OpenSea failed for ${failedWallets.length}/${targetWallets.length} wallet(s). Trying direct mint fallback...`;
     await notify(summary);
-    return attemptDirectMint(contractAddress, sourceWallet, chainName);
+    return attemptDirectMint(contractAddress, sourceWallet, chainName, {
+      ...directOpts,
+      targetWallets: failedWallets,
+    });
   }
 
   await notify(summary);
