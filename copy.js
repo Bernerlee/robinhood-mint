@@ -476,7 +476,6 @@ async function dbSaveArmedMint(job) {
     stage_label: job.stageLabel,
     qty: job.qty,
     expected_total_wei: String(job.expectedTotalWei ?? "0"),
-    wallet_addresses: (job.walletAddresses || []).join(","),
     fire_at: new Date(job.fireAt).toISOString(),
     status: "armed",
   });
@@ -525,13 +524,37 @@ function isAuthorizedChat(ctx) {
 }
 
 async function notify(text) {
+  // Telegram rejects messages over 4096 chars. Cut on a line boundary so we
+  // never silently lose the whole message (e.g. a long failure report).
+  const MAX = 4000;
+  let body = String(text);
+  if (body.length > MAX) {
+    const cut = body.lastIndexOf("\n", MAX - 40);
+    body = body.slice(0, cut > 0 ? cut : MAX - 40) + "\n…(truncated)";
+  }
   try {
-    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, text, {
+    await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, body, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
     });
   } catch (err) {
     console.error(`[telegram] failed to send message: ${err.message}`);
+    // Bad/unbalanced HTML (e.g. a stray "<" in an error string) makes
+    // Telegram reject the message. Resend as plain text so it still arrives.
+    if (/parse entities|can't parse/i.test(err.message || "")) {
+      try {
+        const plain = body
+          .replace(/<[^>]+>/g, "")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&amp;/g, "&");
+        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, plain, {
+          disable_web_page_preview: true,
+        });
+      } catch (err2) {
+        console.error(`[telegram] plain-text resend failed: ${err2.message}`);
+      }
+    }
   }
 }
 
@@ -581,37 +604,6 @@ async function getEthPriceUsd() {
   return price;
 }
 
-function parseWalletSelection(text, walletList) {
-  const raw = String(text || "")
-    .trim()
-    .toLowerCase();
-  if (!raw) throw new Error("empty");
-  if (raw === "all") return walletList.slice();
-
-  // numbers: 1,3,5  (1-based index into mint wallets)
-  const parts = raw
-    .split(/[,\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const selected = [];
-  for (const p of parts) {
-    if (!/^\d+$/.test(p)) throw new Error(`bad index: ${p}`);
-    const idx = Number(p) - 1;
-    if (idx < 0 || idx >= walletList.length)
-      throw new Error(`index out of range: ${p}`);
-    selected.push(walletList[idx]);
-  }
-  if (selected.length === 0) throw new Error("no wallets");
-  // unique by address
-  const seen = new Set();
-  return selected.filter((w) => {
-    const a = w.address.toLowerCase();
-    if (seen.has(a)) return false;
-    seen.add(a);
-    return true;
-  });
-}
-
 function parseFundAmount(amountStr, chainKey) {
   const raw = String(amountStr || "")
     .trim()
@@ -648,12 +640,7 @@ function parseChainKey(text) {
   return null;
 }
 
-async function runFundGas(
-  ctx,
-  amountStr,
-  chainKey = "rh",
-  selectedWallets = null,
-) {
+async function runFundGas(ctx, amountStr, chainKey = "rh") {
   try {
     if (!sponsorWallet) {
       return ctx.reply("❌ No sponsor/funder wallet configured.");
@@ -661,9 +648,6 @@ async function runFundGas(
     if (!wallets || wallets.length === 0) {
       return ctx.reply("❌ No minting wallets loaded.");
     }
-
-    const targets =
-      selectedWallets && selectedWallets.length > 0 ? selectedWallets : wallets;
 
     const { pool, label } = getChainRpcPool(chainKey);
     const isArc = String(chainKey).toLowerCase() === "arc";
@@ -678,13 +662,12 @@ async function runFundGas(
       if (parsed.type === "usd") {
         if (isArc) {
           // Arc native gas token is USDC ≈ $1
-          amountEth = Number(parsed.usd.toFixed(6));
+          amountEth = parsed.usd;
           usdNote = ` (≈ $${parsed.usd} USDC)`;
         } else {
           const ethPrice = await getEthPriceUsd();
-          // Round to 8 decimals so ethers.parseEther never underflows
-          amountEth = Number((parsed.usd / ethPrice).toFixed(8));
-          usdNote = ` ($${parsed.usd} ≈ ${amountEth} ETH @ $${ethPrice.toFixed(2)})`;
+          amountEth = parsed.usd / ethPrice;
+          usdNote = ` ($${parsed.usd} ≈ ${amountEth.toFixed(6)} ETH @ $${ethPrice.toFixed(2)})`;
         }
       } else {
         amountEth = parsed.amount;
@@ -713,9 +696,8 @@ async function runFundGas(
       );
     }
 
-    // normalize string for ethers (max 18 decimals, we use ≤ 8)
-    const amountWei = ethers.parseEther(Number(amountEth).toFixed(8));
-    const totalNeeded = amountWei * BigInt(targets.length);
+    const amountWei = ethers.parseEther(String(amountEth));
+    const totalNeeded = amountWei * BigInt(wallets.length);
     const provider = pool.current();
     const funder = sponsorWallet.signer.connect(provider);
 
@@ -729,7 +711,7 @@ async function runFundGas(
     }
 
     await ctx.reply(
-      `⛽ Sending <b>${Number(amountEth).toFixed(6)}</b> ${tokenName} on <b>${label}</b> to <b>${targets.length}</b> wallet(s)...${usdNote}\n` +
+      `⛽ Sending <b>${Number(amountEth).toFixed(6)}</b> ${tokenName} on <b>${label}</b> to <b>${wallets.length}</b> wallets...${usdNote}\n` +
         `From: <code>${escapeHtml(sponsorWallet.address.slice(0, 12))}...</code>`,
       { parse_mode: "HTML" },
     );
@@ -737,7 +719,7 @@ async function runFundGas(
     const results = [];
     let successCount = 0;
 
-    for (const w of targets) {
+    for (const w of wallets) {
       try {
         const tx = await funder.sendTransaction({
           to: w.address,
@@ -757,7 +739,7 @@ async function runFundGas(
 
     await ctx.reply(
       `⛽ <b>Fund Gas result</b> (${label})\n` +
-        `Success: <b>${successCount}/${targets.length}</b>\n\n` +
+        `Success: <b>${successCount}/${wallets.length}</b>\n\n` +
         results.join("\n"),
       { parse_mode: "HTML" },
     );
@@ -911,9 +893,6 @@ async function runAcceptOffers(ctx, payload) {
       { parse_mode: "HTML" },
     );
 
-    // OpenSea Seaport conduit (common operator used for transfers)
-    const OPENSEA_CONDUIT = "0x1E0049783F008A0085193E00003D00cd54003c71";
-
     for (const m of matches) {
       try {
         if (!m.orderHash) {
@@ -956,115 +935,67 @@ async function runAcceptOffers(ctx, payload) {
           }
         }
 
-        function findHexData(node, depth = 0) {
-          if (depth > 8 || node == null) return null;
-          if (typeof node === "string" && /^0x[0-9a-fA-F]{10,}$/.test(node)) {
-            // prefer long calldata over addresses
-            if (node.length >= 20) return node;
-          }
-          if (Array.isArray(node)) {
-            for (const x of node) {
-              const f = findHexData(x, depth + 1);
-              if (f && f.length > 42) return f;
-            }
-            return null;
-          }
-          if (typeof node === "object") {
-            // common keys first
-            for (const k of [
-              "data",
-              "calldata",
-              "input",
-              "input_data",
-              "callData",
-            ]) {
-              if (
-                typeof node[k] === "string" &&
-                node[k].startsWith("0x") &&
-                node[k].length > 42
-              ) {
-                return node[k];
-              }
-            }
-            for (const v of Object.values(node)) {
-              const f = findHexData(v, depth + 1);
-              if (f && f.length > 42) return f;
-            }
-          }
-          return null;
-        }
+        // Dig out a sendable EVM transaction from several possible OpenSea shapes
+        const candidates = [
+          fulfill?.fulfillment_data?.transaction,
+          fulfill?.fulfillment_data?.orders?.[0]?.transaction,
+          fulfill?.transaction,
+          fulfill?.actions?.find?.((a) => a?.transaction)?.transaction,
+          fulfill?.actions?.[0]?.transaction,
+          fulfill,
+        ].filter(Boolean);
 
-        function findTo(node) {
-          const t =
-            node?.fulfillment_data?.transaction?.to ||
-            node?.transaction?.to ||
-            node?.to ||
-            node?.fulfillment_data?.transaction?.target ||
-            null;
-          if (typeof t === "string" && t.startsWith("0x")) return t;
-          return m.protocolAddress;
-        }
+        let to = null;
+        let data = null;
+        let value = 0n;
 
-        function findValue(node) {
-          const v =
-            node?.fulfillment_data?.transaction?.value ??
-            node?.transaction?.value ??
-            node?.value ??
-            "0";
-          try {
-            return BigInt(v || "0");
-          } catch {
-            return 0n;
+        for (const c of candidates) {
+          const maybeTo = c.to || c.target || c.contract_address || null;
+          const maybeData =
+            c.data || c.input_data || c.calldata || c.input || null;
+          const maybeValue = c.value ?? c.wei_value ?? "0";
+
+          if (
+            maybeTo &&
+            typeof maybeData === "string" &&
+            maybeData.startsWith("0x")
+          ) {
+            to = maybeTo;
+            data = maybeData;
+            try {
+              value = BigInt(maybeValue || "0");
+            } catch {
+              value = 0n;
+            }
+            break;
           }
         }
 
-        let to = findTo(fulfill);
-        let data = findHexData(fulfill);
-        let value = findValue(fulfill);
-
-        // If OpenSea only returned a function signature + structured input,
-        // we cannot safely send without hex calldata.
+        // Some responses put calldata under seaport function call fields
         if (!data) {
-          const preview = JSON.stringify(fulfill).slice(0, 220);
+          const fd = fulfill?.fulfillment_data || fulfill;
+          const raw =
+            fd?.transaction?.data || fd?.calldata || fd?.input_data || null;
+          if (typeof raw === "string" && raw.startsWith("0x")) {
+            data = raw;
+            to = to || fd?.transaction?.to || m.protocolAddress;
+          }
+        }
+
+        if (
+          !to ||
+          !data ||
+          typeof data !== "string" ||
+          !data.startsWith("0x")
+        ) {
+          const preview = JSON.stringify(fulfill).slice(0, 180);
           results.push(
-            `❌ ${m.wallet.address.slice(0, 10)}... #${m.tokenId} no hex calldata in fulfillment. ` +
-              `OpenSea returned structured Seaport data only. Preview: ${preview}`,
+            `❌ ${m.wallet.address.slice(0, 10)}... #${m.tokenId} bad fulfillment data: ${preview}`,
           );
           continue;
         }
 
         const signer = m.wallet.signer.connect(provider);
-
-        // Ensure OpenSea can transfer this NFT from the seller wallet
-        try {
-          const nft = new ethers.Contract(
-            contract,
-            [
-              "function isApprovedForAll(address owner, address operator) view returns (bool)",
-              "function setApprovalForAll(address operator, bool approved)",
-            ],
-            signer,
-          );
-          const approved = await nft.isApprovedForAll(
-            m.wallet.address,
-            OPENSEA_CONDUIT,
-          );
-          if (!approved) {
-            const approveTx = await nft.setApprovalForAll(
-              OPENSEA_CONDUIT,
-              true,
-            );
-            await approveTx.wait();
-            results.push(
-              `🔓 ${m.wallet.address.slice(0, 10)}... approved collection for OpenSea conduit`,
-            );
-          }
-        } catch (aprErr) {
-          results.push(
-            `⚠️ ${m.wallet.address.slice(0, 10)}... approval check/tx: ${(aprErr.message || "").slice(0, 60)}`,
-          );
-        }
-
         const tx = await signer.sendTransaction({ to, data, value });
         const receipt = await tx.wait();
 
@@ -1091,30 +1022,6 @@ async function runAcceptOffers(ctx, payload) {
   } catch (err) {
     await ctx.reply(`❌ Accept failed: ${err.message}`);
   }
-}
-
-function parseContractOrOpenSeaLink(text) {
-  const raw = String(text || "").trim();
-
-  // contract address
-  if (ethers.isAddress(raw)) {
-    return { type: "contract", value: raw };
-  }
-
-  // OpenSea collection URL
-  // https://opensea.io/collection/slug
-  // https://opensea.io/collection/slug/...
-  const m = raw.match(/opensea\.io\/collection\/([^\/\?\s#]+)/i);
-  if (m && m[1]) {
-    return { type: "slug", value: decodeURIComponent(m[1]) };
-  }
-
-  // bare slug (no 0x, no spaces)
-  if (/^[a-z0-9][a-z0-9\-]{1,80}$/i.test(raw) && !raw.startsWith("0x")) {
-    return { type: "slug", value: raw };
-  }
-
-  throw new Error("invalid");
 }
 
 function formatUtc(ts) {
@@ -1164,26 +1071,13 @@ async function fireArmedMint(job) {
         `Slug: <code>${escapeHtml(job.slug)}</code>\n` +
         `Stage: <b>${escapeHtml(job.stageLabel)}</b>\n` +
         `Qty: <b>${job.qty}</b>\n` +
-        `Wallets: <b>${(job.walletAddresses && job.walletAddresses.length) || (wallets || []).length}</b>`,
+        `Wallets: <b>${(wallets || []).length}</b>`,
     );
 
     if (!wallets || wallets.length === 0) {
       await notify("❌ No minting wallets configured");
       return;
     }
-
-    let mintList = wallets;
-    if (job.walletAddresses && job.walletAddresses.length > 0) {
-      const set = new Set(job.walletAddresses.map((a) => a.toLowerCase()));
-      mintList = wallets.filter((w) => set.has(w.address.toLowerCase()));
-    }
-
-    if (mintList.length === 0) {
-      await notify("❌ No matching wallets for this armed job");
-      return;
-    }
-
-    await notify(`🧾 Minting with <b>${mintList.length}</b> wallet(s)`);
 
     const { pool } = getChainRpcPool(job.chainKey);
     const provider = pool.current();
@@ -1200,7 +1094,7 @@ async function fireArmedMint(job) {
     );
 
     const settled = await Promise.all(
-      mintList.map(async (w) => {
+      wallets.map(async (w) => {
         const started = Date.now();
         let lastErr = "no attempt";
 
@@ -1257,27 +1151,6 @@ async function fireArmedMint(job) {
           await new Promise((r) => setTimeout(r, RETRY_MS));
         }
 
-        // OpenSea window exhausted → try direct contract mint once (if we have a contract)
-        if (job.contract && ethers.isAddress(job.contract)) {
-          try {
-            const chain = chainConfigs[job.chainKey] || chainConfigs.robinhood;
-            const r = await tryDirectContractMint({
-              provider,
-              signer: w.signer,
-              contractAddress: job.contract,
-              qty: job.qty,
-              maxValueWei: job.expectedTotalWei || "0",
-              explorerBaseUrl: chain.explorerApiBase || null,
-            });
-            if (r.ok) {
-              return `✅ ${w.address.slice(0, 10)}... direct ${r.method} | ${r.hash.slice(0, 12)}...`;
-            }
-            lastErr = `direct: ${r.error}`;
-          } catch (err) {
-            lastErr = `direct: ${(err.message || "fail").slice(0, 70)}`;
-          }
-        }
-
         return `❌ ${w.address.slice(0, 10)}... gave up → ${lastErr}`;
       }),
     );
@@ -1289,7 +1162,7 @@ async function fireArmedMint(job) {
 
     await notify(
       `📋 <b>Armed mint result</b>\n` +
-        `Success: <b>${success}/${mintList.length}</b>\n\n` +
+        `Success: <b>${success}/${wallets.length}</b>\n\n` +
         results.join("\n"),
     );
   } catch (err) {
@@ -1341,7 +1214,6 @@ async function armMintJob(ctx, job) {
       `Slug: <code>${escapeHtml(full.slug)}</code>\n` +
       `Stage: <b>${escapeHtml(full.stageLabel)}</b>\n` +
       `Qty: <b>${full.qty}</b>\n` +
-      `Wallets: <b>${(full.walletAddresses || []).length || "all"}</b>\n` +
       `Locked total: <b>${ethers.formatEther(BigInt(full.expectedTotalWei || "0"))}</b> ETH\n` +
       `Fire at: <code>${escapeHtml(fireUtc)}</code>\n` +
       `Timer: ~<b>${inMin}</b> min (5s early)\n\n` +
@@ -1395,11 +1267,9 @@ async function cancelArmedById(ctx, id) {
       armedMints.splice(idx, 1);
     }
     await dbMarkArmedDone(id, "cancelled");
-    await ctx.reply(
-      `🛰 Cancelled <code>${escapeHtml(id)}</code>\n` +
-        `Timer cleared + DB status set to cancelled.`,
-      { parse_mode: "HTML" },
-    );
+    await ctx.reply(`🛰 Cancelled <code>${escapeHtml(id)}</code>`, {
+      parse_mode: "HTML",
+    });
   } catch (err) {
     await ctx.reply(`❌ Cancel failed: ${err.message}`);
   }
@@ -1419,10 +1289,6 @@ async function restoreArmedMintsFromDb() {
         stageLabel: row.stage_label,
         qty: row.qty,
         expectedTotalWei: row.expected_total_wei || "0",
-        walletAddresses: (row.wallet_addresses || "")
-          .split(",")
-          .map((s) => s.trim().toLowerCase())
-          .filter(Boolean),
         fireAt,
       };
 
@@ -1436,55 +1302,29 @@ async function restoreArmedMintsFromDb() {
   }
 }
 
-async function runInspectDrop(ctx, chainKey, inputText) {
+async function runInspectDrop(ctx, chainKey, contractAddress) {
   try {
-    const { label, openseaSlug } = getChainRpcPool(chainKey);
-
-    let parsed;
-    try {
-      parsed = parseContractOrOpenSeaLink(inputText);
-    } catch {
-      return ctx.reply(
-        "❌ Send a contract <code>0x...</code>, collection slug, or OpenSea link.\n" +
-          "Example: https://opensea.io/collection/my-drop",
-        { parse_mode: "HTML" },
-      );
+    if (!ethers.isAddress(contractAddress)) {
+      return ctx.reply("❌ Invalid contract address.");
     }
+
+    const { label, openseaSlug } = getChainRpcPool(chainKey);
 
     await ctx.reply(
       `📅 Inspecting drop on <b>${label}</b>\n` +
-        `Input: <code>${escapeHtml(inputText)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
         `Please wait...`,
       { parse_mode: "HTML" },
     );
 
-    let slug = null;
-    let contractAddress = null;
-
-    if (parsed.type === "slug") {
-      slug = parsed.value;
-      try {
-        const dropProbe = await openseaFetch(
-          `/drops/${encodeURIComponent(slug)}`,
-        );
-        contractAddress =
-          dropProbe.contract_address ||
-          dropProbe.contract ||
-          dropProbe.address ||
-          null;
-      } catch {
-        // still try drops with slug
-      }
-    } else {
-      contractAddress = parsed.value;
-      try {
-        slug = await resolveCollectionSlug(contractAddress, openseaSlug);
-      } catch (err) {
-        return ctx.reply(`❌ OpenSea lookup failed: ${err.message}`);
-      }
-      if (!slug)
-        return ctx.reply("❌ No OpenSea collection found for that contract.");
+    let slug;
+    try {
+      slug = await resolveCollectionSlug(contractAddress, openseaSlug);
+    } catch (err) {
+      return ctx.reply(`❌ OpenSea lookup failed: ${err.message}`);
     }
+    if (!slug)
+      return ctx.reply("❌ No OpenSea collection found for that contract.");
 
     let drop;
     try {
@@ -1558,7 +1398,7 @@ async function runInspectDrop(ctx, chainKey, inputText) {
     pendingSchedule = {
       step: "stage",
       chain: chainKey,
-      contract: contractAddress || "",
+      contract: contractAddress,
       slug,
       stages,
       label,
@@ -1625,8 +1465,7 @@ async function runListOffers(
     for (const w of wallets) {
       let tokenIds = [];
 
-      // 1) OpenSea account NFTs (looser matching)
-      let apiNftCount = 0;
+      // 1) OpenSea account NFTs
       try {
         let next = null;
         let pages = 0;
@@ -1636,8 +1475,6 @@ async function runListOffers(
             (next ? `&next=${encodeURIComponent(next)}` : "");
           const data = await openseaFetch(path);
           const nfts = data.nfts || [];
-          apiNftCount += nfts.length;
-
           for (const item of nfts) {
             const c = String(
               item.contract ||
@@ -1646,65 +1483,26 @@ async function runListOffers(
                 item.collection?.contract ||
                 "",
             ).toLowerCase();
-
-            const itemSlug = String(
-              item.collection ||
-                item.collection_slug ||
-                item.collectionSlug ||
-                "",
-            ).toLowerCase();
-
-            const slugMatch =
-              itemSlug && itemSlug === String(slug).toLowerCase();
-            const contractMatch = c && c === contractLower;
-
-            // keep if contract matches OR collection slug matches
-            if (!contractMatch && !slugMatch) continue;
+            if (c && c !== contractLower) continue;
+            // if contract field missing, still try when collection slug matches
+            const itemSlug = item.collection || item.collection_slug || "";
+            if (
+              !c &&
+              itemSlug &&
+              String(itemSlug).toLowerCase() !== String(slug).toLowerCase()
+            )
+              continue;
+            if (!c && !itemSlug) continue;
 
             const id = item.identifier ?? item.token_id ?? item.tokenId;
             if (id != null) tokenIds.push(String(id));
           }
-
           next = data.next || null;
           pages += 1;
-        } while (next && pages < 10);
+        } while (next && pages < 6);
       } catch (err) {
         debugOwned.push(
-          `${w.address.slice(0, 10)}... NFT fetch err: ${(err.message || "").slice(0, 60)}`,
-        );
-      }
-
-      // 2) Fallback: on-chain enumerable (if contract supports it)
-      if (tokenIds.length === 0) {
-        try {
-          const { pool } = getChainRpcPool(chainKey);
-          const provider = pool.current();
-          const nft = new ethers.Contract(
-            contractAddress,
-            [
-              "function balanceOf(address) view returns (uint256)",
-              "function tokenOfOwnerByIndex(address,uint256) view returns (uint256)",
-            ],
-            provider,
-          );
-          const bal = Number(await nft.balanceOf(w.address));
-          for (let i = 0; i < bal && i < 50; i++) {
-            const id = await nft.tokenOfOwnerByIndex(w.address, i);
-            tokenIds.push(String(id));
-          }
-          if (bal > 0) {
-            debugOwned.push(
-              `${w.address.slice(0, 10)}... on-chain balance ${bal}`,
-            );
-          }
-        } catch {
-          // not enumerable / failed
-        }
-      }
-
-      if (tokenIds.length === 0) {
-        debugOwned.push(
-          `${w.address.slice(0, 10)}... owns 0 matched (API nfts seen: ${apiNftCount})`,
+          `${w.address.slice(0, 10)}... NFT fetch err: ${(err.message || "").slice(0, 50)}`,
         );
       }
 
@@ -1773,40 +1571,15 @@ async function runListOffers(
         }
 
         let pass = true;
-
-        // Min filter
         if (minPrice) {
           if (minPrice.kind === "usd") {
-            if (minPrice.value <= 0) {
-              // $0 min → do not filter out when USD is unknown
-              pass = true;
-            } else if (usd != null) {
-              if (usd < minPrice.value) pass = false;
-            } else if (ethUsd && ["ETH", "WETH"].includes(parsed.currency)) {
-              const approx = parsed.native * ethUsd;
-              if (approx < minPrice.value) pass = false;
-            } else {
-              // can't evaluate USD min without usd — keep offer (don't drop)
-              pass = true;
-            }
-          } else {
-            if (parsed.native < minPrice.value) pass = false;
-          }
+            if (usd == null || usd < minPrice.value) pass = false;
+          } else if (parsed.native < minPrice.value) pass = false;
         }
-
-        // Max filter
         if (pass && maxPrice) {
           if (maxPrice.kind === "usd") {
-            if (usd != null) {
-              if (usd > maxPrice.value) pass = false;
-            } else if (ethUsd && ["ETH", "WETH"].includes(parsed.currency)) {
-              const approx = parsed.native * ethUsd;
-              if (approx > maxPrice.value) pass = false;
-            }
-            // if USD unknown and max is set, keep offer (safer to show than hide)
-          } else {
-            if (parsed.native > maxPrice.value) pass = false;
-          }
+            if (usd == null || usd > maxPrice.value) pass = false;
+          } else if (parsed.native > maxPrice.value) pass = false;
         }
 
         if (!pass) {
@@ -1876,7 +1649,6 @@ async function runListOffers(
     }
 
     pendingAcceptOffers = {
-      step: "count",
       matches: acceptable,
       chainKey,
       contract: contractAddress,
@@ -1884,9 +1656,8 @@ async function runListOffers(
     };
 
     await ctx.reply(
-      `💸 Found <b>${acceptable.length}</b> acceptable offer(s).\n\n` +
-        `How many NFTs to sell?\n` +
-        `Reply <code>all</code> or a number (e.g. <code>1</code>).`,
+      `💸 Accept <b>${acceptable.length}</b> offer(s)?\n\n` +
+        `Type <code>yes</code> to accept, or <code>no</code> to cancel.`,
       { parse_mode: "HTML" },
     );
   } catch (err) {
@@ -2288,14 +2059,12 @@ bot.hears("⛽ Fund Gas", async (ctx) => {
 
   pendingFundGas = { step: "chain" };
   pendingCollect = null;
-  pendingOffers = null;
-  pendingSchedule = null;
 
   await ctx.reply(
     "⛽ <b>Fund Gas</b>\n\n" +
-      "Step 1/3 — Chain:\n" +
+      "Step 1/2 — Choose chain:\n" +
       "<code>rh</code> / <code>eth</code> / <code>ink</code> / <code>arc</code>\n\n" +
-      "Or <code>cancel</code>.",
+      "Or type <code>cancel</code>.",
     { parse_mode: "HTML" },
   );
 });
@@ -2452,39 +2221,6 @@ bot.on("text", async (ctx, next) => {
     return next();
   }
 
-  // Armed mint controls must work even when no other flow is active
-  if (text.toLowerCase() === "disarm") {
-    for (const j of armedMints) {
-      try {
-        clearTimeout(j.timer);
-      } catch {}
-      try {
-        await dbMarkArmedDone(j.id, "cancelled");
-      } catch {}
-    }
-    // also cancel any DB rows still marked armed (timer list may be incomplete)
-    try {
-      const rows = await dbListArmedMints();
-      for (const row of rows) {
-        try {
-          await dbMarkArmedDone(row.id, "cancelled");
-        } catch {}
-      }
-    } catch {}
-    const n = armedMints.length;
-    armedMints = [];
-    return ctx.reply(`🛰 Disarmed all jobs (cleared timers + DB).`, {
-      parse_mode: "HTML",
-    });
-  }
-
-  if (text.toLowerCase().startsWith("cancelarm ")) {
-    const id = text.slice("cancelarm ".length).trim();
-    if (!id) return ctx.reply("Usage: cancelarm <id>");
-    await cancelArmedById(ctx, id);
-    return;
-  }
-
   // If no interactive flow is active, do not block other handlers
   if (
     !pendingFundGas &&
@@ -2505,55 +2241,25 @@ bot.on("text", async (ctx, next) => {
     return ctx.reply("Cancelled.");
   }
 
-  // Accept offers: count → yes/no
+  // Accept offers confirmation
   if (pendingAcceptOffers) {
-    const ans = text.toLowerCase().trim();
-
-    if (ans === "no" || ans === "n" || ans === "cancel") {
+    const ans = text.toLowerCase();
+    if (ans === "no" || ans === "n") {
       pendingAcceptOffers = null;
       return ctx.reply("Cancelled offer accept.");
     }
-
-    if (pendingAcceptOffers.step === "count") {
-      let take = pendingAcceptOffers.matches.length;
-      if (ans === "all") {
-        take = pendingAcceptOffers.matches.length;
-      } else if (/^\d+$/.test(ans)) {
-        take = Number(ans);
-        if (take < 1) return ctx.reply("❌ Number must be ≥ 1");
-        if (take > pendingAcceptOffers.matches.length) {
-          take = pendingAcceptOffers.matches.length;
-        }
-      } else {
-        return ctx.reply("Reply <code>all</code> or a number.", {
-          parse_mode: "HTML",
-        });
-      }
-
-      pendingAcceptOffers = {
-        ...pendingAcceptOffers,
-        step: "confirm",
-        matches: pendingAcceptOffers.matches.slice(0, take),
-      };
-
-      return ctx.reply(
-        `💸 Accept <b>${pendingAcceptOffers.matches.length}</b> offer(s)?\n\n` +
-          `Type <code>yes</code> or <code>no</code>.`,
-        { parse_mode: "HTML" },
-      );
+    if (ans === "yes" || ans === "y") {
+      const payload = pendingAcceptOffers;
+      pendingAcceptOffers = null;
+      await runAcceptOffers(ctx, payload);
+      return;
     }
-
-    if (pendingAcceptOffers.step === "confirm") {
-      if (ans === "yes" || ans === "y") {
-        const payload = pendingAcceptOffers;
-        pendingAcceptOffers = null;
-        await runAcceptOffers(ctx, payload);
-        return;
-      }
-      return ctx.reply("Type <code>yes</code> or <code>no</code>.", {
+    return ctx.reply(
+      "Type <code>yes</code> to accept or <code>no</code> to cancel.",
+      {
         parse_mode: "HTML",
-      });
-    }
+      },
+    );
   }
 
   // Fund gas flow: chain → amount
@@ -2561,55 +2267,22 @@ bot.on("text", async (ctx, next) => {
     if (pendingFundGas.step === "chain") {
       const chainKey = parseChainKey(text);
       if (!chainKey) {
-        return ctx.reply("❌ Invalid chain. Use: rh / eth / ink / arc");
+        return ctx.reply("❌ Invalid chain. Use: rh / eth / ink");
       }
-
-      const list = (wallets || [])
-        .map(
-          (w, i) =>
-            `${i + 1}. <code>${escapeHtml(w.address.slice(0, 12))}...</code>`,
-        )
-        .join("\n");
-
-      pendingFundGas = { step: "wallets", chain: chainKey };
+      pendingFundGas = { step: "amount", chain: chainKey };
+      const tokenName = chainKey === "arc" ? "USDC" : "ETH";
       return ctx.reply(
-        `⛽ Step 2/3 — Which wallets?\n\n` +
-          `${list || "No wallets"}\n\n` +
-          `Reply <code>all</code> or numbers like <code>1,3,5</code>`,
+        `⛽ Step 2/2 — Amount for <b>each</b> wallet on <b>${chainKey}</b>.\n\n` +
+          `Native ${tokenName}: <code>0.002</code>\n` +
+          `Or dollars: <code>$3</code> / <code>3usd</code>`,
         { parse_mode: "HTML" },
       );
     }
 
-    if (pendingFundGas.step === "wallets") {
-      try {
-        const selected = parseWalletSelection(text, wallets);
-        pendingFundGas = {
-          step: "amount",
-          chain: pendingFundGas.chain,
-          selected,
-        };
-        const tokenName = pendingFundGas.chain === "arc" ? "USDC" : "ETH";
-        return ctx.reply(
-          `⛽ Step 3/3 — Amount for <b>each</b> selected wallet (${selected.length}).\n\n` +
-            `Native ${tokenName}: <code>0.002</code>\n` +
-            `Or dollars: <code>$3</code>`,
-          { parse_mode: "HTML" },
-        );
-      } catch {
-        return ctx.reply(
-          "❌ Use <code>all</code> or indexes like <code>1,2,4</code>",
-          {
-            parse_mode: "HTML",
-          },
-        );
-      }
-    }
-
     if (pendingFundGas.step === "amount") {
       const chainKey = pendingFundGas.chain || "rh";
-      const selected = pendingFundGas.selected || null;
       pendingFundGas = null;
-      await runFundGas(ctx, text, chainKey, selected);
+      await runFundGas(ctx, text, chainKey);
       return;
     }
   }
@@ -2622,17 +2295,18 @@ bot.on("text", async (ctx, next) => {
         return ctx.reply("❌ Invalid chain. Use: rh / eth / ink / arc");
       pendingSchedule = { step: "contract", chain: chainKey };
       return ctx.reply(
-        "📅 Step 2 — Send collection <b>contract</b>, <b>slug</b>, or OpenSea <b>link</b>.\n\n" +
-          "Examples:\n" +
-          "<code>0xabc...</code>\n" +
-          "<code>my-collection-slug</code>\n" +
-          "<code>https://opensea.io/collection/my-collection-slug</code>",
-        { parse_mode: "HTML" },
+        "📅 Step 2 — Send the collection <b>contract address</b>.",
+        {
+          parse_mode: "HTML",
+        },
       );
     }
 
     if (pendingSchedule.step === "contract") {
+      if (!ethers.isAddress(text))
+        return ctx.reply("❌ Invalid contract address.");
       const chainKey = pendingSchedule.chain;
+      // runInspectDrop will set pendingSchedule.step = 'stage'
       await runInspectDrop(ctx, chainKey, text);
       return;
     }
@@ -2666,48 +2340,14 @@ bot.on("text", async (ctx, next) => {
         return ctx.reply("❌ Quantity must be an integer 1–100");
       }
 
-      const list = (wallets || [])
-        .map(
-          (w, i) =>
-            `${i + 1}. <code>${escapeHtml(w.address.slice(0, 12))}...</code>`,
-        )
-        .join("\n");
-
-      pendingSchedule = {
-        ...pendingSchedule,
-        step: "wallets",
-        qty,
-      };
-
-      return ctx.reply(
-        `📅 Which wallets should mint?\n\n` +
-          `${list || "No wallets"}\n\n` +
-          `Reply <code>all</code> or numbers like <code>1,3,5</code>`,
-        { parse_mode: "HTML" },
-      );
-    }
-
-    if (pendingSchedule.step === "wallets") {
-      let selected;
-      try {
-        selected = parseWalletSelection(text, wallets);
-      } catch {
-        return ctx.reply(
-          "❌ Use <code>all</code> or indexes like <code>1,2,4</code>",
-          {
-            parse_mode: "HTML",
-          },
-        );
-      }
-
       const stage = pendingSchedule.stage;
       const stageLabel =
         stage.label ||
         stage.stage_type ||
         stage.name ||
         `Stage ${pendingSchedule.stageIndex + 1}`;
-      const qty = pendingSchedule.qty;
 
+      // Read stage price (usually wei string per token)
       let pricePerTokenWei = null;
       const rawPrice =
         stage.price ?? stage.mint_price ?? stage.price_wei ?? null;
@@ -2744,13 +2384,34 @@ bot.on("text", async (ctx, next) => {
         qty,
         fireAt,
         expectedTotalWei,
-        walletAddresses: selected.map((w) => w.address.toLowerCase()),
       };
 
       pendingSchedule = null;
       await armMintJob(ctx, job);
       return;
     }
+  }
+
+  // cancel one armed job: cancelarm arm-...
+  if (text.toLowerCase().startsWith("cancelarm ")) {
+    const id = text.slice("cancelarm ".length).trim();
+    if (!id) return ctx.reply("Usage: cancelarm <id>");
+    await cancelArmedById(ctx, id);
+    return;
+  }
+
+  if (text.toLowerCase() === "disarm") {
+    for (const j of armedMints) {
+      try {
+        clearTimeout(j.timer);
+      } catch {}
+      try {
+        await dbMarkArmedDone(j.id, "cancelled");
+      } catch {}
+    }
+    const n = armedMints.length;
+    armedMints = [];
+    return ctx.reply(`🛰 Disarmed <b>${n}</b> job(s).`, { parse_mode: "HTML" });
   }
 
   // Offers flow: chain → contract → min → max
@@ -3265,196 +2926,154 @@ async function buildDropMintTransaction(slug, minter, quantity) {
   });
 }
 
-async function tryDirectContractMint({
-  provider,
-  signer,
-  contractAddress,
-  qty,
-  maxValueWei = null, // optional lock; null = allow any
-  explorerBaseUrl = null, // optional, for ABI fetch
-}) {
-  const addr = signer.address;
-  const results = [];
+// ---------------------------------------------------------------------------
+// Fallback: direct on-chain mint when OpenSea can't build the mint tx
+// ---------------------------------------------------------------------------
+//
+// Strategy, most reliable first. For every wallet we build a list of
+// candidate transactions and try them in order:
+//
+//   1. REPLAY  — fetch the watched wallet's own mint tx from the chain and
+//      re-send the same calldata + the same ETH value from OUR wallet (the
+//      watched wallet's address, if it appears in the calldata, is swapped
+//      for ours). This uses the exact function and the exact price the
+//      collection actually accepted, so it works for custom mint functions
+//      that no hard-coded signature list could ever cover.
+//   2. ABI GUESS — every mint/claim/purchase-style function in the verified
+//      ABI (proxy implementations included), with arguments filled in by
+//      type, plus a short list of common signatures as a last resort.
+//
+// Every candidate is SIMULATED with estimateGas first. A candidate that
+// would revert is skipped without spending gas; only one that simulates
+// cleanly is broadcast.
 
-  // Common public mint ABIs (try in order)
-  const candidates = [
-    {
-      name: "mint(uint256)",
-      abi: ["function mint(uint256 amount) payable"],
-      args: [qty],
-    },
-    {
-      name: "mint(address,uint256)",
-      abi: ["function mint(address to, uint256 amount) payable"],
-      args: [addr, qty],
-    },
-    {
-      name: "publicMint(uint256)",
-      abi: ["function publicMint(uint256 amount) payable"],
-      args: [qty],
-    },
-    {
-      name: "mintPublic(uint256)",
-      abi: ["function mintPublic(uint256 amount) payable"],
-      args: [qty],
-    },
-    {
-      name: "claim(uint256)",
-      abi: ["function claim(uint256 amount) payable"],
-      args: [qty],
-    },
-    {
-      name: "claim(address,uint256)",
-      abi: ["function claim(address to, uint256 amount) payable"],
-      args: [addr, qty],
-    },
-    {
-      name: "mintTo(address,uint256)",
-      abi: ["function mintTo(address to, uint256 amount) payable"],
-      args: [addr, qty],
-    },
-    // qty=1 variants some contracts use
-    {
-      name: "mint()",
-      abi: ["function mint() payable"],
-      args: [],
-      onlyIfQty1: true,
-    },
-  ];
+const DIRECT_MINT_NAME_RE = /(mint|claim|purchase|buy|sale)/i;
+// admin / setter style functions that match the regex above but are never
+// a public mint
+const DIRECT_MINT_EXCLUDE_RE =
+  /^(set|update|withdraw|toggle|pause|unpause|burn|transfer|approve|is|get|has|can|remove|add)|owner|admin|team|airdrop|reserve|dev/i;
+const DIRECT_QTY_PARAM_RE = /(qty|quantity|amount|count|num)/i;
+const DIRECT_MAX_CANDIDATES = Number(
+  process.env.DIRECT_MINT_MAX_CANDIDATES || 40,
+);
 
-  // Optional: pull ABI from explorer and add matching mint* functions
-  if (explorerBaseUrl) {
-    try {
-      const url = `${explorerBaseUrl}/api?module=contract&action=getabi&address=${contractAddress}`;
-      const res = await fetchWithTimeout(url, {}, 10000);
-      const json = await res.json();
-      if (json?.status === "1" && json?.result) {
-        const abi = JSON.parse(json.result);
-        for (const item of abi) {
-          if (item.type !== "function") continue;
-          const n = (item.name || "").toLowerCase();
-          if (!/(mint|claim)/.test(n)) continue;
-          if (
-            item.stateMutability === "view" ||
-            item.stateMutability === "pure"
-          )
-            continue;
-          const inputs = item.inputs || [];
-          // only simple shapes we can fill
-          const types = inputs.map((i) => i.type);
-          let args = null;
-          if (types.length === 0) {
-            if (qty !== 1) continue;
-            args = [];
-          } else if (types.length === 1 && types[0] === "uint256") {
-            args = [qty];
-          } else if (
-            types.length === 2 &&
-            types[0] === "address" &&
-            types[1] === "uint256"
-          ) {
-            args = [addr, qty];
-          } else if (
-            types.length === 2 &&
-            types[0] === "uint256" &&
-            types[1] === "address"
-          ) {
-            args = [qty, addr];
-          } else {
-            continue;
-          }
-          const sig = `${item.name}(${types.join(",")})`;
-          candidates.push({
-            name: `explorer:${sig}`,
-            abi: [
-              `function ${sig}${item.stateMutability === "payable" ? " payable" : ""}`,
-            ],
-            args,
-          });
-        }
-      }
-    } catch (err) {
-      results.push(`abi-fetch: ${(err.message || "").slice(0, 60)}`);
+const DIRECT_MINT_ABI_FALLBACK = [
+  "function mint() public payable",
+  "function mint(uint256 quantity) public payable",
+  "function mint(address to) public payable",
+  "function mint(address to, uint256 quantity) public payable",
+  "function publicMint() public payable",
+  "function publicMint(uint256 quantity) public payable",
+  "function claim() public payable",
+  "function claim(uint256 quantity) public payable",
+  "function claim(address to, uint256 quantity) public payable",
+  "function safeMint(address to) public payable",
+  "function safeMint(address to, uint256 quantity) public payable",
+  "function mintNFT(uint256 quantity) public payable",
+  "function mintPublic(uint256 quantity) public payable",
+];
+
+// Zero-arg view functions that commonly expose the per-token mint price.
+const PRICE_GETTER_NAMES = [
+  "mintPrice",
+  "price",
+  "cost",
+  "publicPrice",
+  "publicMintPrice",
+  "salePrice",
+  "tokenPrice",
+  "mintCost",
+  "getMintPrice",
+  "PRICE",
+  "MINT_PRICE",
+];
+const PRICE_GETTER_ABI = PRICE_GETTER_NAMES.map(
+  (n) => `function ${n}() view returns (uint256)`,
+);
+
+function mergeAbis(...abis) {
+  const seen = new Set();
+  const out = [];
+  for (const abi of abis) {
+    for (const item of abi || []) {
+      const key = `${item.type}:${item.name || ""}:${(item.inputs || [])
+        .map((i) => i.type)
+        .join(",")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
     }
   }
-
-  let lastErr = "no candidate worked";
-
-  for (const c of candidates) {
-    if (c.onlyIfQty1 && qty !== 1) continue;
-    try {
-      const contract = new ethers.Contract(
-        contractAddress,
-        c.abi,
-        signer.connect(provider),
-      );
-      const fn = Object.values(contract.interface.fragments).find(
-        (f) => f.type === "function" && c.abi[0].includes(f.name),
-      );
-      const fnName = c.abi[0].match(/function\s+(\w+)/)?.[1];
-      if (!fnName || !contract[fnName]) {
-        lastErr = `${c.name}: no fn`;
-        continue;
-      }
-
-      // estimate value: try 0 first, then leave to caller if needed
-      let overrides = {};
-      try {
-        const gas = await contract[fnName].estimateGas(...c.args, {
-          value: 0n,
-        });
-        overrides = { gasLimit: (gas * 12n) / 10n, value: 0n };
-      } catch (estErr) {
-        // if estimate fails with value 0, skip (paid mint without known price is unsafe)
-        lastErr = `${c.name}: ${String(estErr.shortMessage || estErr.message).slice(0, 80)}`;
-        continue;
-      }
-
-      if (maxValueWei != null && overrides.value > BigInt(maxValueWei)) {
-        lastErr = `${c.name}: value > locked price`;
-        continue;
-      }
-
-      const tx = await contract[fnName](...c.args, overrides);
-      const receipt = await tx.wait();
-      if (receipt.status === 1) {
-        return { ok: true, hash: tx.hash, method: c.name, tried: results };
-      }
-      lastErr = `${c.name}: reverted`;
-    } catch (err) {
-      lastErr = `${c.name}: ${String(err.shortMessage || err.message).slice(0, 80)}`;
-      results.push(lastErr);
-    }
-  }
-
-  return { ok: false, error: lastErr, tried: results };
+  return out;
 }
-
-// ---------------------------------------------------------------------------
-// Fallback: direct on-chain mint when there's no OpenSea Drop
-// ---------------------------------------------------------------------------
 
 async function fetchAbiFromExplorer(
   contractAddress,
   explorerBase,
   explorerKey = "",
+  chainId = null,
 ) {
   if (!explorerBase) {
     console.warn("[explorer] No explorer API base configured");
     return null;
   }
 
-  // Note: This path works for Blockscout-style explorers (Robinhood + Ink).
-  // Etherscan uses a different format, so Ethereum fallback may still fail for now.
-  const url = `${explorerBase}/smart-contracts/${contractAddress}${
-    explorerKey ? `?apikey=${explorerKey}` : ""
-  }`;
+  const keyQs = (prefix) =>
+    explorerKey ? `${prefix}apikey=${encodeURIComponent(explorerKey)}` : "";
 
   try {
-    const res = await fetchWithTimeout(url, {}, 10000);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.abi || null;
+    // Etherscan-style (Ethereum). For the multichain v2 API set
+    // ETH_EXPLORER_API_BASE=https://api.etherscan.io/v2/api
+    if (/etherscan/i.test(explorerBase)) {
+      const url =
+        `${explorerBase}?module=contract&action=getabi&address=${contractAddress}` +
+        (chainId ? `&chainid=${chainId}` : "") +
+        keyQs("&");
+      const res = await fetchWithTimeout(url, {}, 10000);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.status !== "1" || typeof data.result !== "string") {
+        console.warn(
+          `[explorer] etherscan getabi: ${String(data.result || data.message).slice(0, 100)}`,
+        );
+        return null;
+      }
+      return JSON.parse(data.result);
+    }
+
+    // Blockscout-style (Robinhood, Ink, ...)
+    const getBlockscout = async (addr) => {
+      const res = await fetchWithTimeout(
+        `${explorerBase}/smart-contracts/${addr}${keyQs("?")}`,
+        {},
+        10000,
+      );
+      if (!res.ok) return null;
+      return res.json();
+    };
+
+    const data = await getBlockscout(contractAddress);
+    if (!data) return null;
+
+    const abis = [Array.isArray(data.abi) ? data.abi : []];
+
+    // Proxy contracts: the mint function lives on the implementation, so
+    // pull that ABI too instead of only seeing the proxy's.
+    const implAddrs = [
+      ...(data.implementations || []).map((i) => i.address_hash || i.address),
+      data.implementation_address,
+    ].filter((a) => a && ethers.isAddress(a));
+    for (const addr of [...new Set(implAddrs)].slice(0, 2)) {
+      try {
+        const impl = await getBlockscout(addr);
+        if (Array.isArray(impl?.abi)) abis.push(impl.abi);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const merged = mergeAbis(...abis);
+    return merged.length ? merged : null;
   } catch (err) {
     console.warn(
       `[explorer] ABI fetch failed for ${contractAddress}: ${err.message}`,
@@ -3470,11 +3089,217 @@ function abiHasFunction(abi, name) {
   );
 }
 
+function shortEthersReason(err) {
+  return String(err?.reason || err?.shortMessage || err?.message || err)
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+}
+
+// Candidate 1: replay the watched wallet's own mint tx from our wallet.
+function buildReplayCandidate(srcTx, sourceWallet, targetAddress) {
+  if (!srcTx || !srcTx.to || !srcTx.data || srcTx.data === "0x") return null;
+
+  let data = srcTx.data.toLowerCase();
+  const ours = targetAddress.toLowerCase().replace(/^0x/, "");
+  const theirs = new Set(
+    [sourceWallet, srcTx.from]
+      .filter(Boolean)
+      .map((a) => a.toLowerCase().replace(/^0x/, "")),
+  );
+  for (const addr of theirs) {
+    if (addr === ours) continue;
+    data = data.split(addr).join(ours);
+  }
+  return {
+    label: "replay of source tx",
+    to: srcTx.to,
+    data,
+    value: BigInt(srcTx.value ?? 0n),
+  };
+}
+
+// Pick a value for one ABI parameter, or say we can't.
+function directArgForParam(param, walletAddress, qty, uintCount) {
+  const t = param.type;
+  if (t === "address") return { ok: true, v: walletAddress };
+  if (/^uint\d*$/.test(t)) {
+    // Only treat a uint as "quantity" when it's the only one or is named
+    // like one — never guess a tokenId / stage id and mint the wrong thing.
+    if (uintCount === 1 || DIRECT_QTY_PARAM_RE.test(param.name || "")) {
+      return { ok: true, v: BigInt(qty) };
+    }
+    return { ok: false };
+  }
+  if (t === "bool") return { ok: true, v: false };
+  if (t === "string") return { ok: true, v: "" };
+  if (t === "bytes") return { ok: true, v: "0x" };
+  if (/^bytes\d+$/.test(t)) {
+    return { ok: true, v: "0x" + "00".repeat(Number(t.slice(5))) };
+  }
+  if (t.endsWith("[]")) return { ok: true, v: [] }; // e.g. empty merkle proof
+  return { ok: false };
+}
+
+// Candidate 2: mint-style functions from an ABI, arguments filled by type.
+function buildAbiCandidates(
+  abi,
+  contractAddress,
+  walletAddress,
+  qtys,
+  valueForQty,
+) {
+  let iface;
+  try {
+    iface = new ethers.Interface(abi);
+  } catch (err) {
+    console.warn(`[direct-mint] could not parse ABI: ${err.message}`);
+    return [];
+  }
+
+  const rank = (f) =>
+    /^(public)?mint$/i.test(f.name) ? 0 : /^(mint|claim)/i.test(f.name) ? 1 : 2;
+
+  const fns = iface.fragments
+    .filter(
+      (f) =>
+        f.type === "function" &&
+        DIRECT_MINT_NAME_RE.test(f.name) &&
+        !DIRECT_MINT_EXCLUDE_RE.test(f.name) &&
+        (f.stateMutability === "payable" || f.stateMutability === "nonpayable"),
+    )
+    .sort((a, b) => rank(a) - rank(b) || a.inputs.length - b.inputs.length);
+
+  const out = [];
+  const seen = new Set();
+
+  for (const frag of fns) {
+    const uintCount = frag.inputs.filter((i) =>
+      /^uint\d*$/.test(i.type),
+    ).length;
+    for (const qty of qtys) {
+      const args = [];
+      let ok = true;
+      for (const p of frag.inputs) {
+        const r = directArgForParam(p, walletAddress, qty, uintCount);
+        if (!r.ok) {
+          ok = false;
+          break;
+        }
+        args.push(r.v);
+      }
+      if (!ok) continue;
+
+      let data;
+      try {
+        data = iface.encodeFunctionData(frag, args);
+      } catch {
+        continue;
+      }
+      const value = frag.payable ? valueForQty(qty) : 0n;
+      const key = `${data}:${value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        label: `${frag.format("sighash")} qty=${qty}`,
+        to: contractAddress,
+        data,
+        value,
+      });
+    }
+  }
+  return out;
+}
+
+// Per-token price: from the watched wallet's tx if it paid something,
+// otherwise from common on-chain price getters, otherwise free (0).
+async function discoverUnitPriceWei(contractAddress, provider, srcTx, srcQty) {
+  if (srcTx && BigInt(srcTx.value ?? 0n) > 0n) {
+    return BigInt(srcTx.value) / BigInt(Math.max(srcQty, 1));
+  }
+  const c = new ethers.Contract(contractAddress, PRICE_GETTER_ABI, provider);
+  const settled = await Promise.allSettled(
+    PRICE_GETTER_NAMES.map((n) => c[n]()),
+  );
+  for (const s of settled) {
+    if (
+      s.status === "fulfilled" &&
+      typeof s.value === "bigint" &&
+      s.value > 0n
+    ) {
+      return s.value;
+    }
+  }
+  return 0n;
+}
+
+// Simulate, balance-check, then broadcast one candidate.
+async function trySendDirectCandidate(cand, payer, provider, maxPriceEth) {
+  const valueEth = Number(ethers.formatEther(cand.value));
+  if (
+    maxPriceEth !== null &&
+    maxPriceEth !== undefined &&
+    valueEth > maxPriceEth
+  ) {
+    return {
+      ok: false,
+      reason: `price ${valueEth} ETH above limit ${maxPriceEth}`,
+    };
+  }
+
+  let gasLimit;
+  try {
+    const est = await provider.estimateGas({
+      from: payer.address,
+      to: cand.to,
+      data: cand.data,
+      value: cand.value,
+    });
+    gasLimit = (est * 120n) / 100n;
+  } catch (err) {
+    return { ok: false, reason: `would revert: ${shortEthersReason(err)}` };
+  }
+
+  try {
+    const [balance, feeData] = await Promise.all([
+      provider.getBalance(payer.address),
+      provider.getFeeData(),
+    ]);
+    const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
+    const need = cand.value + gasLimit * gasPrice;
+    if (balance < need) {
+      return {
+        ok: false,
+        reason: `insufficient balance (need ~${ethers.formatEther(need)} ETH)`,
+      };
+    }
+
+    const tx = await payer.signer.connect(provider).sendTransaction({
+      to: cand.to,
+      data: cand.data,
+      value: cand.value,
+      gasLimit,
+    });
+    const receipt = await tx.wait();
+    if (receipt && receipt.status === 1) return { ok: true, hash: tx.hash };
+    return { ok: false, reason: "reverted on-chain", stop: true };
+  } catch (err) {
+    // err.receipt is set when the tx was mined but reverted — stop spending
+    // gas on further variants for this wallet in that case.
+    return {
+      ok: false,
+      reason: `send failed: ${shortEthersReason(err)}`,
+      stop: Boolean(err?.receipt),
+    };
+  }
+}
+
 async function attemptDirectMint(
   contractAddress,
   sourceWallet,
   chainName = "robinhood",
+  opts = {},
 ) {
+  const { sourceTxHash = null, detectedQty = 1, targetWallets = null } = opts;
   const chain = chainConfigs[chainName] || chainConfigs.robinhood;
 
   const activeRpcPool =
@@ -3486,10 +3311,9 @@ async function attemptDirectMint(
           ? arcRpcPool
           : rpcPool;
 
-  const activeDryRun = chain.dryRun;
-  const explorerBase = chain.explorerApiBase || null;
+  const contractKey = contractAddress.toLowerCase();
 
-  if (activeDryRun) {
+  if (chain.dryRun) {
     await notify(
       `⚙️ <b>Direct mint fallback</b>\n` +
         `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
@@ -3498,83 +3322,182 @@ async function attemptDirectMint(
     return;
   }
 
-  if ((!wallets || wallets.length === 0) && !signer) {
+  if (!signer && wallets.length === 0) {
     await notify(`❌ No minting wallet available for direct mint`);
     return;
   }
-
   if (!activeRpcPool) {
     await notify(`❌ No RPC pool ready for ${chainName}`);
     return;
   }
 
   const provider = activeRpcPool.current();
-  const mintWallets =
-    wallets && wallets.length > 0
-      ? wallets
-      : [{ address: WALLET_ADDRESS, signer }];
 
-  // Prefer free/public mints; paid only if MINT_VALUE_ETH is set
-  const maxValueWei = process.env.MINT_VALUE_ETH
-    ? ethers.parseEther(process.env.MINT_VALUE_ETH).toString()
-    : "0"; // lock to 0 by default (safe); set env if paid public mint
+  // Only the wallets OpenSea failed for (or all, if none were specified),
+  // and never a wallet that already minted this collection.
+  let mintWallets =
+    targetWallets && targetWallets.length > 0
+      ? targetWallets
+      : wallets.length > 0
+        ? wallets
+        : [{ address: WALLET_ADDRESS, signer }];
+  mintWallets = mintWallets.filter(
+    (w) => !successfulMints.has(`${contractKey}:${w.address.toLowerCase()}`),
+  );
+  if (mintWallets.length === 0) {
+    await notify(
+      `⏭ <b>Direct mint skipped</b>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `All wallets already minted this collection.`,
+    );
+    return;
+  }
 
-  const results = [];
-  let anySuccess = false;
+  // 1) The watched wallet's own mint tx (best source of truth)
+  let srcTx = null;
+  if (sourceTxHash) {
+    try {
+      srcTx = await activeRpcPool.withFailover((p) =>
+        p.getTransaction(sourceTxHash),
+      );
+    } catch (err) {
+      console.warn(`[direct-mint] could not fetch source tx: ${err.message}`);
+    }
+  }
 
-  await notify(
-    `⚙️ <b>Direct mint fallback</b>\n` +
-      `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-      `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-      `Wallets: <b>${mintWallets.length}</b>`,
+  // 2) Verified ABI (proxy implementations included)
+  const remoteAbi = await fetchAbiFromExplorer(
+    contractAddress,
+    chain.explorerApiBase,
+    chain.explorerApiKey || "",
+    chain.chainId,
   );
 
-  for (const wallet of mintWallets) {
+  // 3) Price. MINT_VALUE_ETH, if set, is a fixed value sent with every call.
+  const overrideWei = process.env.MINT_VALUE_ETH
+    ? ethers.parseEther(process.env.MINT_VALUE_ETH)
+    : null;
+  let unitPriceWei = 0n;
+  if (overrideWei === null) {
     try {
-      // Try qty 1 first, then a few more if you want
-      const qtys = [1, 2, 3, 5];
-      let walletOk = false;
-      let lastDetail = "";
-
-      for (const qty of qtys) {
-        const r = await tryDirectContractMint({
-          provider,
-          signer: wallet.signer,
-          contractAddress,
-          qty,
-          maxValueWei,
-          explorerBaseUrl: explorerBase,
-        });
-
-        if (r.ok) {
-          results.push(
-            `✅ ${wallet.address.slice(0, 10)}... qty ${qty} | ${r.method} | ${r.hash.slice(0, 12)}...`,
-          );
-          walletOk = true;
-          anySuccess = true;
-          break;
-        }
-        lastDetail = r.error || "failed";
-      }
-
-      if (!walletOk) {
-        results.push(`❌ ${wallet.address.slice(0, 10)}... ${lastDetail}`);
-      }
+      unitPriceWei = await discoverUnitPriceWei(
+        contractAddress,
+        provider,
+        srcTx,
+        detectedQty,
+      );
     } catch (err) {
+      console.warn(`[direct-mint] price discovery failed: ${err.message}`);
+    }
+  }
+  const valueForQty = (qty) =>
+    overrideWei !== null ? overrideWei : unitPriceWei * BigInt(qty);
+
+  const qtys = [
+    ...new Set(
+      [detectedQty, 1, 2, 3, 5].filter((n) => Number.isInteger(n) && n > 0),
+    ),
+  ];
+  const useSponsor = isSponsorMode && sponsorWallet;
+
+  const results = [];
+  let successCount = 0;
+
+  for (const wallet of mintWallets) {
+    const cands = [];
+    const replay = buildReplayCandidate(srcTx, sourceWallet, wallet.address);
+    if (replay) cands.push(replay);
+    if (remoteAbi) {
+      cands.push(
+        ...buildAbiCandidates(
+          remoteAbi,
+          contractAddress,
+          wallet.address,
+          qtys,
+          valueForQty,
+        ),
+      );
+    }
+    cands.push(
+      ...buildAbiCandidates(
+        DIRECT_MINT_ABI_FALLBACK,
+        contractAddress,
+        wallet.address,
+        qtys,
+        valueForQty,
+      ),
+    );
+
+    // de-dupe, cap
+    const seen = new Set();
+    const unique = cands
+      .filter((c) => {
+        const k = `${c.to.toLowerCase()}:${c.data}:${c.value}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .slice(0, DIRECT_MAX_CANDIDATES);
+
+    const reasons = new Map();
+    let done = false;
+
+    for (const cand of unique) {
+      // Sponsor can only pay if the calldata names our wallet as recipient;
+      // otherwise the NFT would land in the sponsor wallet.
+      const sponsorOk =
+        useSponsor &&
+        cand.data.toLowerCase().includes(wallet.address.toLowerCase().slice(2));
+      const payer = sponsorOk ? sponsorWallet : wallet;
+
+      const r = await trySendDirectCandidate(
+        cand,
+        payer,
+        provider,
+        chain.maxPriceEth,
+      );
+
+      if (r.ok) {
+        successCount += 1;
+        done = true;
+        successfulMints.add(`${contractKey}:${wallet.address.toLowerCase()}`);
+        dailyStats.success += 1;
+        await saveDailyStats();
+        results.push(
+          `✅ ${wallet.address.slice(0, 10)}... ${cand.label}` +
+            (sponsorOk ? ` (paid by sponsor)` : "") +
+            ` | Tx: ${r.hash.slice(0, 12)}...`,
+        );
+        break;
+      }
+
+      reasons.set(r.reason, (reasons.get(r.reason) || 0) + 1);
+      if (r.stop) break;
+    }
+
+    if (!done) {
+      const top = [...reasons.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([why, n]) => `${why} (x${n})`)
+        .join(" | ");
       results.push(
-        `❌ ${wallet.address.slice(0, 10)}... ${(err.message || "error").slice(0, 80)}`,
+        `❌ ${wallet.address.slice(0, 10)}... ${unique.length} variant(s) tried → ${top || "no usable mint function found"}`,
       );
     }
   }
 
   let msg =
-    `⚙️ <b>Direct mint result</b>\n` +
+    `⚙️ <b>Direct mint fallback</b>\n` +
+    `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
     `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-    `Success: <b>${anySuccess ? "yes" : "no"}</b>\n\n` +
-    results.join("\n");
+    `Source tx: <b>${srcTx ? "found (replay enabled)" : "not found"}</b> | ` +
+    `ABI: <b>${remoteAbi ? "verified" : "unverified"}</b>\n` +
+    `Success: <b>${successCount}/${mintWallets.length}</b>\n\n` +
+    results.map(escapeHtml).join("\n");
 
-  if (!anySuccess) {
-    msg += `\n\n⚠️ Likely allowlist/signature, paid mint without MINT_VALUE_ETH, or custom method.`;
+  if (successCount === 0) {
+    msg += `\n\n⚠️ Likely allowlist/signature-gated, sold out, or not live yet.`;
   }
 
   await notify(msg);
@@ -3690,40 +3613,6 @@ async function copyMint(
   if (!quantityTries.includes(detectedQty)) quantityTries.push(detectedQty);
   quantityTries = [...new Set(quantityTries)].sort((a, b) => b - a);
 
-  // Resolve collection
-  let slug = null;
-  try {
-    slug = await resolveCollectionSlug(contractAddress, activeOpenseaSlug);
-  } catch (err) {
-    await notify(
-      `🔔 <b>${chainLabel} Mint detected</b>\n` +
-        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-        `⚠️ OpenSea lookup failed → trying direct mint`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet, chainName);
-  }
-
-  if (!slug) {
-    await notify(
-      `🔔 <b>${chainLabel} Mint detected</b>\n` +
-        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-        `⚠️ No OpenSea Drop found → trying direct mint`,
-    );
-    return attemptDirectMint(contractAddress, sourceWallet, chainName);
-  }
-
-  // Initial summary message
-  await notify(
-    `🔔 <b>${chainLabel} Mint detected</b>\n` +
-      `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
-      `Collection: <code>${escapeHtml(slug)}</code>\n` +
-      `Detected qty: <b>${detectedQty}</b>\n` +
-      `Trying quantities: <b>${quantityTries.join(", ")}</b>\n` +
-      `Wallets: <b>${wallets.length || 1}</b>`,
-  );
-
   let targetWallets = activeDryRun
     ? [{ address: wallets[0]?.address || WALLET_ADDRESS || ethers.ZeroAddress }]
     : wallets;
@@ -3768,6 +3657,53 @@ async function copyMint(
     );
   }
 
+  // Everything the direct-mint fallback needs to replay the source mint
+  const directOpts = { sourceTxHash, detectedQty, targetWallets };
+
+  // Resolve collection
+  let slug = null;
+  try {
+    slug = await resolveCollectionSlug(contractAddress, activeOpenseaSlug);
+  } catch (err) {
+    await notify(
+      `🔔 <b>${chainLabel} Mint detected</b>\n` +
+        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `⚠️ OpenSea lookup failed → trying direct mint`,
+    );
+    return attemptDirectMint(
+      contractAddress,
+      sourceWallet,
+      chainName,
+      directOpts,
+    );
+  }
+
+  if (!slug) {
+    await notify(
+      `🔔 <b>${chainLabel} Mint detected</b>\n` +
+        `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+        `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
+        `⚠️ No OpenSea Drop found → trying direct mint`,
+    );
+    return attemptDirectMint(
+      contractAddress,
+      sourceWallet,
+      chainName,
+      directOpts,
+    );
+  }
+
+  // Initial summary message
+  await notify(
+    `🔔 <b>${chainLabel} Mint detected</b>\n` +
+      `From: <code>${escapeHtml(sourceWallet)}</code>\n` +
+      `Collection: <code>${escapeHtml(slug)}</code>\n` +
+      `Detected qty: <b>${detectedQty}</b>\n` +
+      `Trying quantities: <b>${quantityTries.join(", ")}</b>\n` +
+      `Wallets: <b>${wallets.length || 1}</b>`,
+  );
+
   dailyStats.attempted += 1;
   await saveDailyStats();
   let successCount = 0;
@@ -3793,7 +3729,13 @@ async function copyMint(
         continue;
       }
 
-      const valueWei = BigInt(value || "0");
+      let valueWei;
+      try {
+        valueWei = BigInt(value || "0");
+      } catch {
+        lastError = `Bad value from OpenSea: ${String(value).slice(0, 40)}`;
+        continue;
+      }
       const valueEth = Number(ethers.formatEther(valueWei));
 
       if (activeMaxPrice !== null && valueEth > activeMaxPrice) {
@@ -3867,11 +3809,25 @@ async function copyMint(
         `❌ ${targetWallet.address.slice(0, 10)}... failed → ${lastError.slice(0, 80)}`,
       );
     }
+    return walletSuccess;
   };
 
-  // Sequential: one wallet at a time (more consistent, less race)
+  // Sequential: one wallet at a time (more consistent, less race).
+  // Track which wallets OpenSea failed for so ONLY those fall back to a
+  // direct mint — and an unexpected exception counts as a failure instead of
+  // escaping copyMint (which used to skip the fallback entirely).
+  const failedWallets = [];
   for (const targetWallet of targetWallets) {
-    await mintOne(targetWallet);
+    let ok = false;
+    try {
+      ok = await mintOne(targetWallet);
+    } catch (err) {
+      console.error("[mintOne] unexpected error:", err);
+      results.push(
+        `❌ ${targetWallet.address.slice(0, 10)}... crashed → ${cleanOpenSeaError(err.message || "error").slice(0, 80)}`,
+      );
+    }
+    if (!ok) failedWallets.push(targetWallet);
   }
 
   // Final summary message
@@ -3879,14 +3835,21 @@ async function copyMint(
     `📋 <b>Result for</b> <code>${escapeHtml(slug)}</code>\n` +
     `Success: <b>${successCount}/${targetWallets.length}</b> wallets\n\n`;
 
-  summary += results.join("\n");
+  summary += results.map(escapeHtml).join("\n");
 
   if (successCount === 0) {
     dailyStats.failed += 1;
     await saveDailyStats();
-    summary += `\n\n⚠️ All OpenSea attempts failed. Trying direct mint fallback...`;
+  }
+
+  // Fall back for every wallet OpenSea failed for — not only when ALL failed.
+  if (failedWallets.length > 0) {
+    summary += `\n\n⚠️ OpenSea failed for ${failedWallets.length}/${targetWallets.length} wallet(s). Trying direct mint fallback...`;
     await notify(summary);
-    return attemptDirectMint(contractAddress, sourceWallet, chainName);
+    return attemptDirectMint(contractAddress, sourceWallet, chainName, {
+      ...directOpts,
+      targetWallets: failedWallets,
+    });
   }
 
   await notify(summary);
