@@ -320,6 +320,18 @@ if (
 }
 // ===== END MULTI-CHAIN FOUNDATION =====
 
+const BUILD_TAG = "direct-fallback-v2";
+const DRY_ENV_NAMES = {
+  robinhood: "RH_DRY_RUN",
+  ethereum: "ETH_DRY_RUN",
+  ink: "INK_DRY_RUN",
+  arc: "ARC_DRY_RUN",
+};
+console.log(
+  `[startup] build=${BUILD_TAG} pid=${process.pid} | env DRY_RUN=${JSON.stringify(process.env.DRY_RUN)} ` +
+    `RH_DRY_RUN=${JSON.stringify(process.env.RH_DRY_RUN)} -> robinhood.dryRun=${chainConfigs.robinhood.dryRun}`,
+);
+
 const NULL_ADDRESS = "0x0000000000000000000000000000000000000000";
 const ERC721_TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 const OPENSEA_BASE = "https://api.opensea.io/api/v2";
@@ -3317,7 +3329,11 @@ async function attemptDirectMint(
     await notify(
       `⚙️ <b>Direct mint fallback</b>\n` +
         `Contract: <code>${escapeHtml(contractAddress)}</code>\n` +
-        `🧪 Dry run only (not broadcast)`,
+        `🧪 Dry run only (not broadcast)\n` +
+        `Why: <code>${escapeHtml(chainName)}.dryRun=true</code> ` +
+        `(env ${DRY_ENV_NAMES[chainName] || "RH_DRY_RUN"}=${escapeHtml(JSON.stringify(process.env[DRY_ENV_NAMES[chainName] || "RH_DRY_RUN"]))}, ` +
+        `DRY_RUN=${escapeHtml(JSON.stringify(process.env.DRY_RUN))})\n` +
+        `Build: <code>${BUILD_TAG}</code> pid ${process.pid}`,
     );
     return;
   }
@@ -3701,7 +3717,8 @@ async function copyMint(
       `Collection: <code>${escapeHtml(slug)}</code>\n` +
       `Detected qty: <b>${detectedQty}</b>\n` +
       `Trying quantities: <b>${quantityTries.join(", ")}</b>\n` +
-      `Wallets: <b>${wallets.length || 1}</b>`,
+      `Wallets: <b>${wallets.length || 1}</b>\n` +
+      `Mode: <b>${activeDryRun ? "🧪 DRY RUN" : "🔥 LIVE"}</b> | Build: <code>${BUILD_TAG}</code> pid ${process.pid}`,
   );
 
   dailyStats.attempted += 1;
@@ -4183,6 +4200,8 @@ async function main() {
 
   await notify(
     `🤖 <b>Bot started</b>\n` +
+      `Build: <code>${BUILD_TAG}</code> pid ${process.pid}\n` +
+      `Minting wallets loaded: <b>${wallets.length}</b>\n` +
       `Watched wallets: <b>${watchedWallets.length}</b>\n` +
       `Poll: <b>${POLL_INTERVAL_MS}ms</b>\n\n` +
       `🟢 Robinhood: <b>${chainConfigs.robinhood.enabled ? "ON" : "OFF"}</b> (dryRun=${chainConfigs.robinhood.dryRun})\n` +
