@@ -1,6 +1,9 @@
 {
   "name": "adev",
   "type": "module",
+  "scripts": {
+    "start": "node copy.js"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",
     "dotenv": "^16.4.5",
