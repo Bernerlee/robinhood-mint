@@ -95,6 +95,19 @@ function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   );
 }
 
+//Letting Render knows what's going on
+import express from "express";
+const app = express();
+const port = process.env.PORT || 10000;
+
+app.get("/", (req, res) => {
+  res.send("Bot is running smoothly!");
+});
+
+app.listen(port, () => {
+  console.log(`Health check server listening on port ${port}`);
+});
+
 // Telegram's legacy "Markdown" parse mode breaks on any unmatched _ * ` [ ] —
 // which is very easy to hit by accident (e.g. "DRY_RUN", an error message,
 // or an OpenSea slug with an underscore in it). HTML parse mode only cares
